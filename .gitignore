@@ -1,0 +1,17 @@
+# ===== 設定・秘密情報 (OSSには含めない) =====
+cloudflare/keys.env
+cloudflare/wrangler.toml
+cloudflare/.wrangler/
+*.muse-github-snapshot-sync.json
+
+# ===== 実行時データ (個人の通知・テレメトリが入る) =====
+feed/scene.json
+feed/telemetry.json
+feed/audio/
+state/
+
+# ===== ビルド生成物 =====
+bin/
+build-out/
+__pycache__/
+*.pyc

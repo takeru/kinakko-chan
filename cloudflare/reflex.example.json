@@ -1,0 +1,12 @@
+{
+  "on_button_b": {
+    "steps": [
+      {"do": "face", "emotion": "surprise"},
+      {"do": "say", "text": "なあに？ きなこだよ"},
+      {"do": "beep", "freq": 1319, "ms": 100},
+      {"do": "wait", "ms": 1600},
+      {"do": "clear_text"},
+      {"do": "face", "emotion": "normal"}
+    ]
+  }
+}

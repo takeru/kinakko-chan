@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KinakoCore2 シミュレータ</title>
+<style>
+  body { font-family: sans-serif; background:#222; color:#eee; margin:0; padding:16px; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  #lcd { background:#000; width:320px; height:240px; border-radius:10px; position:relative; margin:12px auto; box-shadow:0 0 0 10px #444; overflow:hidden; }
+  .eye { position:absolute; top:88px; width:30px; height:52px; background:#fff; border-radius:50%; transition:all .15s; }
+  #eyeL { left:90px; } #eyeR { right:90px; }
+  .eye.sleep,.eye.blink { height:6px; top:111px; }
+  .eye.happy { height:20px; border-radius:50% 50% 0 0/100% 100% 0 0; background:transparent; border-top:8px solid #fff; }
+  .eye.surprise { height:68px; width:38px; top:80px; }
+  .eye.sad { height:32px; top:98px; }
+  #mouth { position:absolute; left:50%; top:168px; width:48px; height:6px; transform:translateX(-50%); background:#fff; border-radius:99px; transition:all .15s; }
+  #mouth.happy { height:26px; border-radius:0 0 99px 99px; }
+  #mouth.surprise { height:32px; width:24px; border-radius:50%; }
+  #mouth.sleep { height:14px; width:12px; border-radius:50%; }
+  #bubble { position:absolute; top:8px; left:14px; right:14px; background:#282828; color:#fff; border-radius:8px; padding:6px 10px; font-size:14px; display:none; text-align:center; }
+  #big { position:absolute; inset:0; background:#183c78; color:#fff; display:none; text-align:center; padding-top:70px; }
+  #big h2 { margin:0 0 10px; font-size:24px; } #big p { margin:0; font-size:15px; }
+  #status { position:absolute; bottom:4px; left:6px; color:#5a5a5a; font-size:11px; font-family:monospace; }
+  .row { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin:8px 0; }
+  button { font-size:14px; padding:8px 14px; border-radius:8px; border:0; background:#3a3a3a; color:#eee; cursor:pointer; }
+  button:hover { background:#4c4c4c; }
+  textarea { width:100%; height:180px; background:#111; color:#9f9; border:1px solid #444; border-radius:8px; font-family:monospace; font-size:12px; }
+  small { color:#aaa; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 style="font-size:20px;">KinakoCore2 シミュレータ</h1>
+  <p><small>実機ファームと同じシーンDSL（JSON）をブラウザで再生します。実機では約10秒ポーリングで同じJSONが実行されます。</small></p>
+  <div id="lcd">
+    <div id="bubble"></div>
+    <div class="eye" id="eyeL"></div><div class="eye" id="eyeR"></div>
+    <div id="mouth"></div>
+    <div id="big"><h2 id="bigTitle"></h2><p id="bigBody"></p></div>
+    <div id="status">KinakoCore2 sim</div>
+  </div>
+  <div class="row">
+    <button onclick="fire('on_touch')">👆 タッチ</button>
+    <button onclick="fire('on_shake')">🫨 ゆする</button>
+    <button onclick="fire('on_button_a')">ボタンA</button>
+    <button onclick="runScene()">▶ シーン再生</button>
+  </div>
+  <textarea id="scene"></textarea>
+  <div class="row"><small>JSONを書き換えて「シーン再生」で即確認できます（実機DSLと同一形式）。</small></div>
+</div>
+<script>
+"use strict";
+const eyeL = document.getElementById('eyeL'), eyeR = document.getElementById('eyeR'),
+      mouth = document.getElementById('mouth'), bubble = document.getElementById('bubble'),
+      big = document.getElementById('big');
+let resident = null, timers = [];
+function setFace(e) {
+  for (const el of [eyeL, eyeR]) el.className = 'eye' + (['happy','sleep','surprise','sad'].includes(e) ? ' ' + e : '');
+  mouth.className = ''; mouth.id = 'mouth';
+  if (e === 'happy' || e === 'love') mouth.classList.add('happy');
+  if (e === 'surprise') mouth.classList.add('surprise');
+  if (e === 'sleep') mouth.classList.add('sleep');
+  document.getElementById('status').textContent = 'emotion: ' + e;
+}
+setInterval(() => {  // まばたき
+  if (eyeL.classList.contains('happy') || eyeL.classList.contains('sleep')) return;
+  eyeL.classList.add('blink'); eyeR.classList.add('blink');
+  setTimeout(() => { eyeL.classList.remove('blink'); eyeR.classList.remove('blink'); }, 140);
+}, 3400);
+function beep(freq, ms) {
+  try {
+    const ctx = beep.ctx || (beep.ctx = new (window.AudioContext || window.webkitAudioContext)());
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = freq || 880; o.connect(g); g.connect(ctx.destination);
+    g.gain.value = 0.08; o.start(); o.stop(ctx.currentTime + (ms || 120) / 1000);
+  } catch (e) {}
+}
+function runSteps(steps) {
+  timers.forEach(clearTimeout); timers = [];
+  let t = 0;
+  for (const s of steps || []) {
+    timers.push(setTimeout(() => exec(s), t));
+    if (s.do === 'wait') t += s.ms || 500;
+    if (s.do === 'notify') t += 300;
+    if (s.do === 'say') t += 400;
+  }
+}
+function exec(s) {
+  if (s.do === 'face') setFace(s.emotion || 'normal');
+  else if (s.do === 'say') { bubble.textContent = s.text || ''; bubble.style.display = s.text ? 'block' : 'none'; }
+  else if (s.do === 'clear_text') { bubble.style.display = 'none'; big.style.display = 'none'; }
+  else if (s.do === 'notify' || s.do === 'led_text') {
+    document.getElementById('bigTitle').textContent = s.title || s.text || '';
+    document.getElementById('bigBody').textContent = s.body || '';
+    big.style.display = 'block';
+    for (let i = 0; i < (s.beep || 0); i++) setTimeout(() => beep(1568, 120), i * 300);
+    setTimeout(() => big.style.display = 'none', s.duration_ms || 4000);
+  }
+  else if (s.do === 'beep') beep(s.freq, s.ms);
+  else if (s.do === 'tone_seq') (s.tones || []).forEach((x, i) => setTimeout(() => beep(x.freq, x.ms), i * 180));
+}
+function runScene() {
+  try { resident = JSON.parse(document.getElementById('scene').value); } catch (e) { alert('JSONエラー: ' + e.message); return; }
+  runSteps(resident.steps);
+}
+function fire(key) { if (resident && resident[key]) runSteps(resident[key]); }
+document.getElementById('lcd').addEventListener('click', () => fire('on_touch'));
+document.getElementById('scene').value = JSON.stringify({
+  "seq": 1, "name": "hello",
+  "steps": [
+    {"do": "face", "emotion": "happy"},
+    {"do": "say", "text": "こんにちは、きなこだよ！"},
+    {"do": "tone_seq", "tones": [{"freq": 1047, "ms": 110}, {"freq": 1319, "ms": 110}, {"freq": 1568, "ms": 180}]},
+    {"do": "wait", "ms": 2000},
+    {"do": "say", "text": "タッチしたり、ゆすったりしてみて"},
+    {"do": "wait", "ms": 2000},
+    {"do": "clear_text"},
+    {"do": "face", "emotion": "normal"}
+  ],
+  "on_touch": [{"do": "face", "emotion": "love"}, {"do": "beep", "freq": 1568, "ms": 120}, {"do": "wait", "ms": 900}, {"do": "face", "emotion": "normal"}],
+  "on_shake": [{"do": "face", "emotion": "dizzy"}, {"do": "say", "text": "め、めまいが…"}, {"do": "wait", "ms": 1500}, {"do": "clear_text"}, {"do": "face", "emotion": "normal"}],
+  "on_button_a": [{"do": "face", "emotion": "surprise"}, {"do": "beep", "freq": 880, "ms": 150}, {"do": "wait", "ms": 800}, {"do": "face", "emotion": "normal"}]
+}, null, 2);
+runScene();
+</script>
+</body>
+</html>

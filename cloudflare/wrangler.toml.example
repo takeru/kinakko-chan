@@ -1,0 +1,23 @@
+# このファイルを wrangler.toml にコピーして使う (wrangler.toml はGit管理外)
+name = "kinako-core2-bus"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# デプロイ時に deploy.sh が KV を作って id をここへ書き込む (手動なら置換)
+# KV の役割は「低頻度・大きめ」だけ: 最新シーン / マニフェスト / ファーム本体。
+# 頻繁に変わる状態 (イベント/テレメトリ/リフレックス) は DO ストレージ側。
+# (理由は docs/HOW_IT_WORKS.md の課金の章)
+[[kv_namespaces]]
+binding = "KINAKO"
+id = "REPLACE_WITH_KV_ID"
+
+# 端末とのWebSocketを保持する Durable Object
+# SQLite バックエンド (new_sqlite_classes) が必須: ストレージの行読み書き枠が
+# KV バックエンドより桁違いに広く、Worker 側は WebSocket Hibernation API で
+# アイドル時の duration 課金を消している。
+[durable_objects]
+bindings = [{ name = "HUB", class_name = "DeviceHub" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DeviceHub"]
