@@ -157,6 +157,8 @@ def cf_call(path, data=None, ctype="application/json"):
     base, key = cf_base_key()
     req = urllib.request.Request(base + path, data=data, method="POST" if data is not None else "GET")
     req.add_header("X-Admin-Key", key)
+    # 既定の "Python-urllib/x.y" は Cloudflare のブラウザ整合性チェックで 403 (error 1010) になる
+    req.add_header("User-Agent", "kinako-tools/1.0")
     if data is not None: req.add_header("Content-Type", ctype)
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read().decode()

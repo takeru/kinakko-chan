@@ -14,12 +14,15 @@ echo "== KV 作成 (既にあればそのまま) =="
 if grep -q REPLACE_WITH_KV_ID wrangler.toml; then
   OUT=$(npx -y wrangler kv namespace create KINAKO 2>&1 || true)
   ID=$(echo "$OUT" | grep -o 'id = "[a-f0-9]*"' | head -1 | sed 's/.*"\(.*\)"/\1/')
-  if [ -n "$ID" ]; then sed -i.bak "s/REPLACE_WITH_KV_ID/$ID/" wrangler.toml; fi
+  # -i.bak は BSD(mac)/GNU sed 両対応のため。バックアップは残さない
+  if [ -n "$ID" ]; then sed -i.bak "s/REPLACE_WITH_KV_ID/$ID/" wrangler.toml && rm -f wrangler.toml.bak; fi
   grep -q REPLACE_WITH_KV_ID wrangler.toml && { echo "KV id を取得できなかった。wrangler kv namespace list で確認して wrangler.toml に手で入れて"; exit 1; }
 fi
 
 echo "== デプロイ =="
-npx -y wrangler deploy
+# 初回は本体アップロード成功直後の確認APIが 10007 (Worker が存在しない) を返すことがある
+# (作成の反映待ち)。デプロイは冪等なので1回だけやり直す
+npx -y wrangler deploy || { echo "デプロイ失敗。数秒待って再試行"; sleep 5; npx -y wrangler deploy; }
 
 echo "== シークレット登録 =="
 printf %s "$DEVICE_KEY" | npx -y wrangler secret put DEVICE_KEY

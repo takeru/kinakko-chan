@@ -232,6 +232,7 @@ function keyOK(request, expected) {
       || request.headers.get("X-Admin-Key") === expected;
 }
 function json(text) {
+  if (typeof text !== "string") text = JSON.stringify(text);
   return new Response(text, { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 function deny() { return new Response("unauthorized", { status: 401 }); }

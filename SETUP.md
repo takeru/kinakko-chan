@@ -19,9 +19,22 @@ GitHubで空のリポジトリを作る（このプロジェクトでは作成�
 ※ Muse の GitHub App はリポジトリ作成ができない(403)ため、作成だけはユーザー操作。
 
 ## 1. ファームを焼く（どれか1つ）
-ビルド済みバイナリ: `bin/kinako_core2.bin`（無ければ `tools/build.sh` で生成）
+ビルド済みバイナリ: `bin/kinako_core2.bin` / `bin/kinako_core2_merged.bin`（無ければ `tools/build.sh` で生成）
 
-- **esptool（Mac/Linux, 推奨）** — merged bin を 0x0 に焼くだけ
+ビルド環境が無い Mac での準備（Arduino IDE と同じボード定義・ライブラリ置き場を共有する）:
+```
+brew install arduino-cli
+arduino-cli core update-index && arduino-cli core install esp32:esp32
+arduino-cli lib install M5Unified ArduinoJson WebSockets
+sh tools/build.sh
+```
+
+- **arduino-cli（Mac, いちばん手軽）** — ビルド結果をそのまま書き込む
+  ```
+  arduino-cli board list   # Core2 のポート (/dev/cu.usbserial-XXXX) を確認
+  arduino-cli upload --fqbn esp32:esp32:m5stack_core2 -p /dev/cu.usbserial-XXXX --input-dir build-out firmware/kinako_core2
+  ```
+- **esptool（Mac/Linux）** — merged bin を 0x0 に焼くだけ
   ```
   pip install esptool
   python -m esptool --chip esp32 --port /dev/tty.usbserial-XXXX -b 921600 write_flash 0x0 bin/kinako_core2_merged.bin
@@ -29,7 +42,7 @@ GitHubで空のリポジトリを作る（このプロジェクトでは作成�
   （アプリ単体 `bin/kinako_core2.bin` は OTA配信用。USBで焼くなら merged を使う）
   Arduino IDE でビルドした場合は「スケッチ > コンパイル済みバイナリを出力」でフル構成も可。
 - **Arduino IDE**: ボード M5Stack Core2 を選び `firmware/kinako_core2/kinako_core2.ino` を開いて書き込み。
-  ライブラリ: M5Unified, ArduinoJson v7。
+  ライブラリ: M5Unified, ArduinoJson v7, WebSockets (Markus Sattler)。
 - Mac側のローカルエージェント（Claude Code等）に、private-takeru ハブ経由で
   「Core2が挿さったらこのbinを焼いて」と頼むこともできる。
 
@@ -37,6 +50,15 @@ GitHubで空のリポジトリを作る（このプロジェクトでは作成�
 起動すると設定用WiFi **KinakoCore2-Setup** が立つ（または起動直後にボタンA長押しでも入る）。
 スマホ/PCで接続すると設定ページが開くので入力:
 - 自宅WiFiの SSID / パスワード
+
+**Cloudflare バス（0-A）の場合**:
+- Feed URL: `<Worker URL>/scene.json`
+- Telemetry URL: `<Worker URL>/telemetry`
+- Device Key: `cloudflare/keys.env` の DEVICE_KEY
+  （Mac で `grep '^DEVICE_KEY=' cloudflare/keys.env | cut -d= -f2 | pbcopy` するとスマホに貼り付けられる）
+- GitHub Repo / Token は空欄でよい
+
+**GitHub バス（0-B）の場合**:
 - Feed URL: `https://raw.githubusercontent.com/<owner>/<repo>/main/feed/scene.json`
   （Private repo の場合は次項のトークンも必須）
 - GitHub Repo: `<owner>/<repo>`（テレメトリ上り用、任意）

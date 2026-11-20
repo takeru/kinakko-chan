@@ -14,8 +14,10 @@
  * 「KinakoCore2-Setup」から入力し、端末のNVSにだけ保存する。
  * 起動直後にボタンAを押していても設定APに入る。
  *
- * 必要ライブラリ: M5Unified, M5GFX (M5Unifiedの依存), ArduinoJson v7
- * ボード: M5Stack Core2 (m5stack:esp32:m5stack-core2), OTA用パーティション
+ * 必要ライブラリ: M5Unified, M5GFX (M5Unifiedの依存), ArduinoJson v7,
+ *                WebSockets (Markus Sattler / links2004)
+ * ボード: M5Stack Core2 (esp32:esp32:m5stack_core2 または m5stack:esp32:m5stack_core2),
+ *        OTA用パーティション (既定の 2 x 6.5MB app でよい)
  */
 
 #include <M5Unified.h>
