@@ -31,7 +31,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.3.2"
+#define FW_VERSION "1.4.1"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -157,7 +157,7 @@ void drawFace() {
   if (!faceCanvasOk) faceCanvasOk = (faceCanvas.createSprite(320, 240) != nullptr);
   LovyanGFX& d = faceCanvasOk ? static_cast<LovyanGFX&>(faceCanvas) : static_cast<LovyanGFX&>(M5.Display);
   if (now < bigUntil) {  // 通知の全画面表示
-    d.fillScreen(d.color888(24, 60, 120));
+    d.fillScreen(d.color565(24, 60, 120));
     d.setFont(&fonts::lgfxJapanGothic_24);
     d.setTextColor(TFT_WHITE);
     d.setTextDatum(textdatum_t::middle_center);
@@ -170,63 +170,96 @@ void drawFace() {
     return;
   }
   d.fillScreen(TFT_BLACK);
-  uint16_t white = TFT_WHITE;
-  int eyeY = 105, eyeLX = 105, eyeRX = 215;
-  int ry = 26, rx = 15;
-  if (emotion == "sleep") ry = 3;
-  else if (emotion == "surprise") { ry = 34; rx = 19; }
-  else if (emotion == "sad") ry = 16;
-  else if (emotion == "happy") ry = 10;
-  if (blinking && emotion != "sleep") ry = 3;
+  // ---- きなっこちゃんの顔 (もふもふフード, v1.4.0) ----
+  // ユーザーが選んだぬいぐるみの顔を図形で再構成した常時顔。
+  // 感情とまばたきは目と口の形で表す (色は写真から採った近似値)。
+  uint16_t hoodC  = d.color565(240, 233, 216);  // フード (アイボリー)
+  uint16_t hoodS  = d.color565(221, 209, 187);  // フードの影
+  uint16_t faceC  = d.color565(247, 217, 190);  // 顔 (ピーチ)
+  uint16_t faceS  = d.color565(239, 200, 163);  // 顔の影
+  uint16_t cheekC = d.color565(244, 169, 184);  // ほっぺ
+  uint16_t darkC  = d.color565(43, 35, 32);     // 目と口
+  uint16_t heartC = d.color565(232, 106, 146);  // ハート目
 
+  // フード: 影 → もふもふの縁 (円周上の小円) → 本体
+  d.fillEllipse(160, 136, 120, 106, hoodS);
+  for (int a = 0; a < 360; a += 18) {
+    float r = a * 0.0174533f;
+    int fx = 160 + (int)(116 * cosf(r));
+    int fy = 130 + (int)(102 * sinf(r));
+    d.fillCircle(fx, fy, 13, hoodC);
+  }
+  d.fillEllipse(160, 130, 116, 102, hoodC);
+  // 顔: 影つきの楕円
+  d.fillEllipse(160, 123, 64, 54, faceS);
+  d.fillEllipse(160, 119, 62, 52, faceC);
+  // ほっぺ
+  d.fillCircle(100, 139, 12, cheekC);
+  d.fillCircle(220, 139, 12, cheekC);
+
+  // 目
+  int eyeLX = 134, eyeRX = 186, eyeY = 110;
+  int rx = 7, ry = 10;
+  if (emotion == "surprise") { rx = 9; ry = 13; }
+  else if (emotion == "sad") { ry = 6; eyeY += 2; }
+  if (blinking && emotion != "sleep" && emotion != "happy" &&
+      emotion != "love" && emotion != "dizzy") ry = 2;
   if (emotion == "love") {
     for (int cx : {eyeLX, eyeRX}) {
-      d.fillCircle(cx - 8, eyeY - 8, 9, white);
-      d.fillCircle(cx + 8, eyeY - 8, 9, white);
-      d.fillTriangle(cx - 16, eyeY - 4, cx + 16, eyeY - 4, cx, eyeY + 18, white);
+      d.fillCircle(cx - 5, eyeY - 4, 6, heartC);
+      d.fillCircle(cx + 5, eyeY - 4, 6, heartC);
+      d.fillTriangle(cx - 10, eyeY - 1, cx + 10, eyeY - 1, cx, eyeY + 12, heartC);
     }
   } else if (emotion == "dizzy") {
     for (int cx : {eyeLX, eyeRX}) {
-      d.drawLine(cx - 12, eyeY - 12, cx + 12, eyeY + 12, white);
-      d.drawLine(cx - 12, eyeY + 12, cx + 12, eyeY - 12, white);
-      d.drawLine(cx - 11, eyeY - 12, cx + 13, eyeY + 12, white);
-      d.drawLine(cx - 11, eyeY + 12, cx + 13, eyeY - 12, white);
+      d.drawLine(cx - 7, eyeY - 7, cx + 7, eyeY + 7, darkC);
+      d.drawLine(cx - 7, eyeY + 7, cx + 7, eyeY - 7, darkC);
+      d.drawLine(cx - 6, eyeY - 7, cx + 8, eyeY + 7, darkC);
+      d.drawLine(cx - 6, eyeY + 7, cx + 8, eyeY - 7, darkC);
     }
   } else if (emotion == "happy") {
     // 逆U字の目
-    d.drawArc(eyeLX, eyeY + 6, 13, 16, 180, 360, white);
-    d.drawArc(eyeRX, eyeY + 6, 13, 16, 180, 360, white);
+    d.drawArc(eyeLX, eyeY + 4, 8, 11, 180, 360, darkC);
+    d.drawArc(eyeRX, eyeY + 4, 8, 11, 180, 360, darkC);
+  } else if (emotion == "sleep") {
+    d.fillEllipse(eyeLX, eyeY, 8, 2, darkC);
+    d.fillEllipse(eyeRX, eyeY, 8, 2, darkC);
   } else {
-    d.fillEllipse(eyeLX, eyeY, rx, ry, white);
-    d.fillEllipse(eyeRX, eyeY, (emotion == "think") ? 3 : rx, ry, white);
+    d.fillEllipse(eyeLX, eyeY, rx, ry, darkC);
+    d.fillEllipse(eyeRX, eyeY, (emotion == "think") ? 3 : rx, ry, darkC);
+    if (ry > 3) {  // 目のハイライト (つぶらな瞳)
+      d.fillCircle(eyeLX - 2, eyeY - 3, 2, TFT_WHITE);
+      if (emotion != "think") d.fillCircle(eyeRX - 2, eyeY - 3, 2, TFT_WHITE);
+    }
   }
 
-  // 口
-  int mx = 160, my = 168;
+  // 口 (小さめ)
+  int mx = 160, my = 140;
   if (emotion == "happy" || emotion == "love") {
-    d.drawArc(mx, my - 8, 22, 26, 20, 160, white);
+    d.drawArc(mx, my - 6, 11, 14, 20, 160, darkC);
   } else if (emotion == "sad") {
-    d.drawArc(mx, my + 14, 20, 24, 200, 340, white);
+    d.drawArc(mx, my + 10, 9, 12, 200, 340, darkC);
   } else if (emotion == "surprise") {
-    d.fillEllipse(mx, my, 12, 16, white);
+    d.fillEllipse(mx, my, 6, 8, darkC);
   } else if (emotion == "sleep") {
-    d.fillEllipse(mx, my, 6, 8, white);
+    d.fillEllipse(mx, my + 2, 3, 4, darkC);
   } else {
-    d.fillRoundRect(mx - 24, my - 3, 48, 6, 3, white);
+    d.fillEllipse(mx, my, 5, 4, darkC);
   }
 
   // 吹き出し (セリフ)
   if (bubbleText.length()) {
-    d.fillRoundRect(14, 8, 292, 44, 8, d.color888(40, 40, 40));
+    d.fillRoundRect(14, 8, 292, 44, 8, d.color565(40, 40, 40));
     d.setFont(&fonts::lgfxJapanGothic_16);
     d.setTextColor(TFT_WHITE);
     d.setTextDatum(textdatum_t::middle_center);
     d.drawString(bubbleText, 160, 30);
     d.setTextDatum(textdatum_t::top_left);
   }
-  // 状態行
+  // 状態行 (フードに埋もれないよう暗いピルを敷く)
+  d.fillRoundRect(2, 222, 228, 15, 4, d.color565(28, 24, 20));
   d.setFont(&fonts::Font0);
-  d.setTextColor(d.color888(90, 90, 90));
+  d.setTextColor(d.color565(170, 160, 145));
   String st = "KinakoCore2 v" + String(FW_VERSION) + "  seq:" + String(residentSeq) +
               "  batt:" + String(M5.Power.getBatteryLevel()) + "%";
   d.drawString(st, 6, 226);
@@ -252,7 +285,7 @@ uint16_t parseColor(JsonVariant v, uint16_t def = TFT_WHITE) {
     String c = v.as<const char*>();
     if (c.startsWith("#") && c.length() >= 7) {
       long rgb = strtol(c.c_str() + 1, nullptr, 16);
-      return M5.Display.color888((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+      return M5.Display.color565((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
     }
     return def;
   }
