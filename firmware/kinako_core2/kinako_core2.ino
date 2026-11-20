@@ -31,9 +31,9 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.2.4"
+#define FW_VERSION "1.2.5"
 static const uint32_t FEED_POLL_MS = 10000;
-static const uint32_t OTA_POLL_MS = 600000;
+static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
 
 // ---------------- 設定 (NVS) ----------------
@@ -73,6 +73,7 @@ DNSServer dns;
 // ---------------- WebSocket (ライブ配送) ----------------
 WebSocketsClient wsClient;
 bool wsConnected = false;
+bool otaRequested = false;  // WS で {"type":"ota"} を受けたら次のループで即チェックする
 
 void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
   if (type == WStype_CONNECTED) {
@@ -84,6 +85,8 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
   } else if (type == WStype_TEXT) {
     JsonDocument doc;
     if (!deserializeJson(doc, payload, length)) {
+      // OTA 即時チェックの指示 (シーンではない)
+      if (String(doc["type"] | "") == "ota") { otaRequested = true; return; }
       // transient なシーンは常駐シーン (イベント定義) を上書きせず一回だけ再生する
       bool transient = doc["transient"] | false;
       runScene(doc, !transient);
@@ -620,7 +623,7 @@ void loop() {
   stepMachine();
 
   if (!wsConnected && now - lastFeed > FEED_POLL_MS) { lastFeed = now; pollFeed(); }
-  if (now - lastOta > OTA_POLL_MS) { lastOta = now; pollOta(); }
+  if (otaRequested || now - lastOta > OTA_POLL_MS) { otaRequested = false; lastOta = now; pollOta(); }
   if (now - lastTelem > TELEM_POLL_MS) { lastTelem = now; pushTelemetry(); }
 
   if (bigUntil && now > bigUntil) { bigUntil = 0; faceDirty = true; }

@@ -127,7 +127,12 @@ def main():
         print("リフレックス設定を反映 (Workerが即時応答するルール)")
     if a.cmd == "cf-firmware":
         print(cf_call(f"/admin/firmware?version={a.version}", Path(a.bin).read_bytes(), "application/octet-stream"))
-        print("OTAマニフェスト更新済み (端末が10分以内に自動更新)")
+        # v1.2.5+ は WS の {"type":"ota"} で即時チェックする (旧版は無視するので無害)
+        try:
+            print("即時チェック送信:", cf_call("/admin/send-live", b'{"type":"ota"}'))
+        except Exception as e:
+            print("即時チェック送信に失敗 (ポーリングで拾います):", e)
+        print("OTAマニフェスト更新済み (v1.2.5+ は即時、旧版はポーリングで自動更新)")
     if a.cmd == "cf-telemetry":
         print(cf_call("/admin/telemetry"))
     if a.cmd == "manifest":

@@ -1,0 +1,1 @@
+{"name":"approval-notice","seq":0,"steps":[{"do":"face","emotion":"surprise"},{"beep":2,"body":"GitHub に push するね。カードを見てて","do":"notify","duration_ms":8000,"title":"承認カードが出るよ"},{"do":"face","emotion":"normal"}]}
