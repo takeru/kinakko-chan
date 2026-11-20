@@ -160,3 +160,32 @@ GitHubバスはフォールバックとして残す (ファーム v1.1.0 は両�
 - フックの10秒ポーリングは Worker 26万回/月・DO 26万回/月で枠内に収まるため
   据え置き (間隔を延ばすより起床の速さを優先)。詳細な試算と図は
   docs/HOW_IT_WORKS.md に分離した。
+
+## 追記7: OTA即時トリガと自由描画・画像・TTS受け皿 (2026-11-21, v1.2.5 / v1.3.0)
+- OTA の待ち時間をなくした (v1.2.5): 端末は WS で `{"type":"ota"}` を受けると
+  次のループで即マニフェスト確認する。`kinako.py cf-firmware` は登録直後に
+  このトリガを自動送信する。予備のポーリングも10分→60秒に短縮 (主経路は
+  あくまでトリガ)。これで「登録→数十秒で再起動して新ファーム」が回る。
+- 自由描画ステップ `draw` (v1.3.0): `{"do":"draw","ops":[...]}` で図形を
+  JSON から直接描ける。op は clear / fill_rect / rect / fill_round_rect /
+  round_rect / fill_circle / circle / fill_ellipse / ellipse / line /
+  fill_triangle / triangle / arc / text。色は "#RRGGBB"。描画先は
+  320x240 のオフスクリーン (M5Canvas, PSRAM) で、全 op を描いてから
+  一括表示するのでチラつかない。draw/image の実行中は「キャンバスモード」
+  になり、顔の自動再描画 (まばたき含む) は止まる。`face` か `clear_text`
+  で通常の顔に戻る。通知 (notify) はキャンバスの上に割り込み表示され、
+  終了後はキャンバスが復元される。
+- 画像ステップ `image` (v1.3.0): `{"do":"image","url":"https://...","x":0,"y":0}`
+  で PNG / JPG (1.5MB まで) を取得してキャンバスに描く。
+- TTS の受け皿: 合成そのものは端末では行わない (ESP32 に日本語TTSは載らない)。
+  呼び出し側 (きなこ) が音声合成して WAV を作り、Worker 経由で渡す:
+  `POST /admin/audio?name=speak.wav` で KV に登録し、端末は
+  `GET /audio/<name>` (デバイスキー必須) で取得して `say` の audio_url で
+  再生する。道具は `kinako.py cf-audio` (登録のみ) と `cf-speak` (登録+
+  ライブ再生)。端末の再生上限は 900,000 bytes なので登録時にも弾く。
+  WAV のダウンロード時、URL がフィードと同一オリジンなら端末が
+  X-Device-Key ヘッダを付ける (v1.3.0。異なるオリジンには付けない)。
+  ※ /admin/audio と /audio は Worker の再デプロイ (Mac で deploy.sh) で有効化。
+- 道具側の修正: `cf-live` は送信時に `"transient": true` を必ず付けるように
+  した。付け忘れると端末がライブシーンを常駐シーンとして取り込み、
+  on_touch 等のイベント定義が消えてしまうため (実際に踏んだ)。

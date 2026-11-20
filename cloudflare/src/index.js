@@ -34,6 +34,7 @@
 //   POST /admin/send       シーンをKVに保存し、接続中なら即送信
 //   POST /admin/scene      KV保存のみ
 //   POST /admin/firmware   バイナリ登録 (?version=x.y.z)
+//   POST /admin/audio      TTS等のWAVをKVへ登録 (?name=speak.wav)。端末は GET /audio/<name> で取得 (デバイスキー必須)
 //   GET  /admin/events     端末イベントの新着 (?since=<ts>)
 //   POST /admin/send-live  保存せずライブ送信のみ (transient 用)
 //   POST /admin/reflex     リフレックス設定を DO ストレージへ保存
@@ -67,6 +68,14 @@ export default {
       if (!v) return new Response("no firmware", { status: 404 });
       return new Response(v, { headers: { "Content-Type": "application/octet-stream" } });
     }
+    if (path.startsWith("/audio/") && request.method === "GET") {
+      if (!devOK) return deny();
+      const name = decodeURIComponent(path.slice("/audio/".length));
+      if (!name || name.includes("/")) return new Response("bad name", { status: 400 });
+      const v = await env.KINAKO.get("audio:" + name, { type: "arrayBuffer" });
+      if (!v) return new Response("no audio", { status: 404 });
+      return new Response(v, { headers: { "Content-Type": "audio/wav" } });
+    }
     if (path === "/telemetry" && request.method === "POST") {
       if (!devOK) return deny();
       // WS 送信と同じ置き場所 (DO ストレージ) に一本化する
@@ -96,6 +105,16 @@ export default {
       await env.KINAKO.put("firmware", bin);
       await env.KINAKO.put("manifest", JSON.stringify({ version, bin_url: `${url.origin}/firmware.bin` }));
       return new Response("ok " + bin.byteLength + " bytes, version " + version);
+    }
+    if (path === "/admin/audio" && request.method === "POST") {
+      if (!admOK) return deny();
+      const name = url.searchParams.get("name");
+      if (!name || name.includes("/")) return new Response("name required", { status: 400 });
+      const buf = await request.arrayBuffer();
+      // 端末の再生上限 (playWavFromUrl) が 900,000 bytes なので、ここで弾く
+      if (!buf.byteLength || buf.byteLength > 900000) return new Response("bad size (1..900000)", { status: 400 });
+      await env.KINAKO.put("audio:" + name, buf);
+      return new Response("ok " + buf.byteLength + " bytes, audio/" + name);
     }
     if (path === "/admin/events" && request.method === "GET") {
       if (!admOK) return deny();

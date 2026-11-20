@@ -31,7 +31,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.2.5"
+#define FW_VERSION "1.3.0"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -47,6 +47,9 @@ String bubbleText = "";
 String bigTitle = "", bigBody = "";
 uint32_t bigUntil = 0;
 bool faceDirty = true;
+bool canvasMode = false;            // 自由描画 (draw/image) 中は顔で上書きしない
+bool canvasOk = false;              // オフスクリーン確保済みか
+M5Canvas canvas(&M5.Display);       // 自由描画用オフスクリーン (320x240, PSRAM)
 uint32_t blinkAt = 0;
 bool blinking = false;
 
@@ -147,6 +150,7 @@ String b64encode(const String& in) {
 void drawFace() {
   auto& d = M5.Display;
   uint32_t now = millis();
+  if (canvasMode && now >= bigUntil) { faceDirty = false; return; }  // 自由描画モード中は顔で上書きしない (通知表示中は除く)
   if (now < bigUntil) {  // 通知の全画面表示
     d.fillScreen(d.color888(24, 60, 120));
     d.setFont(&fonts::lgfxJapanGothic_24);
@@ -223,6 +227,110 @@ void drawFace() {
   faceDirty = false;
 }
 
+// ---------------- 自由描画 (draw / image) ----------------
+// URL がフィードと同じオリジン (scheme://host[:port]) か。
+// 同じならデバイスキーを付けてよい (Worker の保護付き配布物用)
+bool sameOrigin(const String& url) {
+  auto origin = [](const String& u) {
+    int p = u.indexOf("://");
+    if (p < 0) return String("");
+    int s = u.indexOf('/', p + 3);
+    return (s < 0) ? u : u.substring(0, s);
+  };
+  return cfgFeed.length() && origin(url) == origin(cfgFeed);
+}
+
+uint16_t parseColor(JsonVariant v, uint16_t def = TFT_WHITE) {
+  if (v.is<const char*>()) {
+    String c = v.as<const char*>();
+    if (c.startsWith("#") && c.length() >= 7) {
+      long rgb = strtol(c.c_str() + 1, nullptr, 16);
+      return M5.Display.color888((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+    }
+    return def;
+  }
+  if (v.is<int>()) return (uint16_t)(v.as<int>() & 0xFFFF);
+  return def;
+}
+
+void ensureCanvas() {
+  if (!canvasOk) {
+    canvasOk = (canvas.createSprite(320, 240) != nullptr);
+    if (canvasOk) canvas.fillScreen(TFT_BLACK);
+  }
+}
+
+// {"do":"draw","ops":[{op:..., ...}, ...]} をオフスクリーンに描いて一括表示する
+void execDraw(JsonArray ops) {
+  if (ops.isNull()) return;
+  ensureCanvas();
+  if (!canvasOk) return;
+  canvasMode = true;
+  for (JsonObject o : ops) {
+    String op = o["op"] | "";
+    uint16_t col = parseColor(o["color"]);
+    int x = o["x"] | 0, y = o["y"] | 0;
+    if (op == "clear") canvas.fillScreen(parseColor(o["color"], TFT_BLACK));
+    else if (op == "fill_rect") canvas.fillRect(x, y, o["w"] | 0, o["h"] | 0, col);
+    else if (op == "rect") canvas.drawRect(x, y, o["w"] | 0, o["h"] | 0, col);
+    else if (op == "fill_round_rect") canvas.fillRoundRect(x, y, o["w"] | 0, o["h"] | 0, o["r"] | 4, col);
+    else if (op == "round_rect") canvas.drawRoundRect(x, y, o["w"] | 0, o["h"] | 0, o["r"] | 4, col);
+    else if (op == "fill_circle") canvas.fillCircle(x, y, o["r"] | 10, col);
+    else if (op == "circle") canvas.drawCircle(x, y, o["r"] | 10, col);
+    else if (op == "fill_ellipse") canvas.fillEllipse(x, y, o["rx"] | 10, o["ry"] | 10, col);
+    else if (op == "ellipse") canvas.drawEllipse(x, y, o["rx"] | 10, o["ry"] | 10, col);
+    else if (op == "line") canvas.drawLine(x, y, o["x2"] | x, o["y2"] | y, col);
+    else if (op == "fill_triangle") canvas.fillTriangle(x, y, o["x2"] | x, o["y2"] | y, o["x3"] | x, o["y3"] | y, col);
+    else if (op == "triangle") canvas.drawTriangle(x, y, o["x2"] | x, o["y2"] | y, o["x3"] | x, o["y3"] | y, col);
+    else if (op == "arc") canvas.drawArc(x, y, o["r0"] | 10, o["r1"] | 12, o["a0"] | 0, o["a1"] | 360, col);
+    else if (op == "text") {
+      int size = o["size"] | 16;
+      canvas.setFont(size >= 20 ? &fonts::lgfxJapanGothic_24 : &fonts::lgfxJapanGothic_16);
+      canvas.setTextColor(col);
+      bool center = String(o["align"] | "") == "center";
+      canvas.setTextDatum(center ? textdatum_t::middle_center : textdatum_t::top_left);
+      canvas.drawString((const char*)(o["text"] | ""), x, y);
+      canvas.setTextDatum(textdatum_t::top_left);
+    }
+  }
+  canvas.pushSprite(0, 0);
+}
+
+// {"do":"image","url":"https://... (PNG/JPG)","x":0,"y":0}
+void execImage(JsonObject s) {
+  String url = s["url"] | "";
+  if (!url.length()) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, url)) return;
+  if (cfgToken.length()) http.addHeader("Authorization", "Bearer " + cfgToken);
+  if (cfgKey.length() && sameOrigin(url)) http.addHeader("X-Device-Key", cfgKey);
+  if (http.GET() != 200) { http.end(); return; }
+  int len = http.getSize();
+  if (len <= 0 || len > 1500000) { http.end(); return; }
+  uint8_t* buf = (uint8_t*)ps_malloc(len);
+  if (!buf) { http.end(); return; }
+  WiFiClient* stream = http.getStreamPtr();
+  size_t got = 0;
+  uint32_t start = millis();
+  while (got < (size_t)len && millis() - start < 10000) {
+    int avail = stream->available();
+    if (avail > 0) got += stream->readBytes(buf + got, min(avail, len - (int)got));
+    else delay(5);
+  }
+  http.end();
+  if (got != (size_t)len) { free(buf); return; }
+  ensureCanvas();
+  if (!canvasOk) { free(buf); return; }
+  canvasMode = true;
+  int x = s["x"] | 0, y = s["y"] | 0;
+  if (len > 3 && buf[0] == 0x89 && buf[1] == 'P') canvas.drawPng(buf, len, x, y);
+  else if (len > 2 && buf[0] == 0xFF && buf[1] == 0xD8) canvas.drawJpg(buf, len, x, y);
+  free(buf);
+  canvas.pushSprite(0, 0);
+}
+
 // ---------------- 音 ----------------
 bool playWavFromUrl(const String& url) {
   WiFiClientSecure client;
@@ -230,6 +338,7 @@ bool playWavFromUrl(const String& url) {
   HTTPClient http;
   if (!http.begin(client, url)) return false;
   if (cfgToken.length()) http.addHeader("Authorization", "Bearer " + cfgToken);
+  if (cfgKey.length() && sameOrigin(url)) http.addHeader("X-Device-Key", cfgKey);
   int code = http.GET();
   if (code != 200) { http.end(); return false; }
   int len = http.getSize();
@@ -268,8 +377,13 @@ void startSteps(JsonArray steps) {
 void execStep(JsonObject s) {
   String act = s["do"] | "";
   if (act == "face") {
+    canvasMode = false;
     emotion = (const char*)(s["emotion"] | "normal");
     faceDirty = true;
+  } else if (act == "draw") {
+    execDraw(s["ops"].as<JsonArray>());
+  } else if (act == "image") {
+    execImage(s);
   } else if (act == "say") {
     bubbleText = (const char*)(s["text"] | "");
     faceDirty = true;
@@ -298,6 +412,7 @@ void execStep(JsonObject s) {
   } else if (act == "brightness") {
     M5.Display.setBrightness(s["value"] | 160);
   } else if (act == "clear_text") {
+    canvasMode = false;
     bubbleText = "";
     bigUntil = 0;
     faceDirty = true;
@@ -626,7 +741,7 @@ void loop() {
   if (otaRequested || now - lastOta > OTA_POLL_MS) { otaRequested = false; lastOta = now; pollOta(); }
   if (now - lastTelem > TELEM_POLL_MS) { lastTelem = now; pushTelemetry(); }
 
-  if (bigUntil && now > bigUntil) { bigUntil = 0; faceDirty = true; }
+  if (bigUntil && now > bigUntil) { bigUntil = 0; if (canvasMode && canvasOk) canvas.pushSprite(0, 0); else faceDirty = true; }
   if (faceDirty) drawFace();
   delay(10);
 }

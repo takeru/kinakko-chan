@@ -16,7 +16,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FEED = ROOT / "feed"
-ACTIONS = {"face", "say", "notify", "beep", "tone_seq", "wait", "led_text", "brightness", "clear_text"}
+ACTIONS = {"face", "say", "notify", "beep", "tone_seq", "wait", "led_text", "brightness", "clear_text", "draw", "image"}
+DRAW_OPS = {"clear", "fill_rect", "rect", "fill_round_rect", "round_rect", "fill_circle", "circle",
+            "fill_ellipse", "ellipse", "line", "fill_triangle", "triangle", "arc", "text"}
 EMOTIONS = {"normal", "happy", "sleep", "surprise", "sad", "love", "think", "dizzy"}
 EVENTS = {"on_touch", "on_button_a", "on_button_b", "on_button_c", "on_shake", "on_tilt"}
 
@@ -33,6 +35,16 @@ def check_steps(steps, where):
             errs.append(f"{where}[{i}]: 未知のemotion: {s.get('emotion')}")
         if s["do"] == "say" and not s.get("text") and not s.get("audio_url"):
             errs.append(f"{where}[{i}]: sayにはtextかaudio_urlが要る")
+        if s["do"] == "draw":
+            ops = s.get("ops")
+            if not isinstance(ops, list) or not ops:
+                errs.append(f"{where}[{i}]: drawにはops (配列) が要る")
+            else:
+                for j, o in enumerate(ops):
+                    if not isinstance(o, dict) or o.get("op") not in DRAW_OPS:
+                        errs.append(f"{where}[{i}].ops[{j}]: 未知のop: {o.get('op') if isinstance(o, dict) else o}")
+        if s["do"] == "image" and not s.get("url"):
+            errs.append(f"{where}[{i}]: imageにはurlが要る")
     return errs
 
 
@@ -83,6 +95,8 @@ def main():
     p = sub.add_parser("cf-reflex"); p.add_argument("file")
     p = sub.add_parser("cf-firmware"); p.add_argument("bin"); p.add_argument("--version", required=True)
     p = sub.add_parser("cf-telemetry")
+    p = sub.add_parser("cf-audio"); p.add_argument("wav"); p.add_argument("name")
+    p = sub.add_parser("cf-speak"); p.add_argument("wav"); p.add_argument("text", nargs="?", default="")
     a = ap.parse_args()
 
     if a.cmd == "validate":
@@ -117,6 +131,9 @@ def main():
         print(f"配信完了: seq={scene['seq']} (端末が約10秒で実行)")
     if a.cmd == "cf-live":
         scene = json.loads(Path(a.file).read_text())
+        # ライブ送信は一回限り (transient)。付けないと端末が常駐シーンとして
+        # 取り込み、イベント定義 (on_touch 等) が消えてしまう
+        scene["transient"] = True
         errs = validate(scene)
         if errs: print("検証エラー:", *errs, sep="\n  "); sys.exit(1)
         print(cf_call("/admin/send-live", json.dumps(scene, ensure_ascii=False).encode()))
@@ -133,6 +150,18 @@ def main():
         except Exception as e:
             print("即時チェック送信に失敗 (ポーリングで拾います):", e)
         print("OTAマニフェスト更新済み (v1.2.5+ は即時、旧版はポーリングで自動更新)")
+    if a.cmd == "cf-audio":
+        print(cf_call(f"/admin/audio?name={a.name}", Path(a.wav).read_bytes(), "audio/wav"))
+        base, _ = cf_base_key()
+        print(f"audio_url: {base}/audio/{a.name}")
+    if a.cmd == "cf-speak":
+        # WAV を speak.wav として登録し、say ステップで即再生する (TTS の受け皿。
+        # 合成は呼び出し側で行い、ここには WAV ファイルを渡す)
+        print(cf_call("/admin/audio?name=speak.wav", Path(a.wav).read_bytes(), "audio/wav"))
+        base, _ = cf_base_key()
+        scene = {"name": "speak", "seq": 0, "transient": True,
+                 "steps": [{"do": "say", "text": a.text, "audio_url": f"{base}/audio/speak.wav"}]}
+        print(cf_call("/admin/send-live", json.dumps(scene, ensure_ascii=False).encode()))
     if a.cmd == "cf-telemetry":
         print(cf_call("/admin/telemetry"))
     if a.cmd == "manifest":
