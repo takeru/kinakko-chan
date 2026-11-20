@@ -31,7 +31,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.2.3"
+#define FW_VERSION "1.2.4"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 600000;
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -394,8 +394,13 @@ String telemetryJson() {
   doc["rssi"] = WiFi.RSSI();
   doc["heap"] = ESP.getFreeHeap();
   doc["uptime_s"] = millis() / 1000;
-  doc["accel"] = serialized(String(ax, 2) + "," + String(ay, 2) + "," + String(az, 2));
-  doc["gyro"] = serialized(String(gx, 1) + "," + String(gy, 1) + "," + String(gz, 1));
+  // 配列で入れる。以前は serialized() で CSV を生挿入しており
+  // "accel":0.12,-0.98,0.05 のような不正な JSON になっていたため、
+  // Worker 側の JSON.parse で弾かれてテレメトリが届かなかった (v1.2.0〜1.2.3 のバグ)
+  JsonArray acc = doc["accel"].to<JsonArray>();
+  acc.add(ax); acc.add(ay); acc.add(az);
+  JsonArray gyr = doc["gyro"].to<JsonArray>();
+  gyr.add(gx); gyr.add(gy); gyr.add(gz);
   doc["touch_count"] = touchCount;
   doc["shake_count"] = shakeCount;
   doc["button_count"] = btnCount;
@@ -408,25 +413,20 @@ String telemetryJson() {
 void pushTelemetry() {
   String tj = telemetryJson();
   if (wsConnected) {
-    // [診断 v1.2.2] 60秒タイマの発火をイベント経路でも知らせる (テレメトリ未着の切り分け用)
-    wsClient.sendTXT("{\"type\":\"event\",\"event\":\"telemetry_tick\"}");
     wsClient.sendTXT("{\"type\":\"telemetry\",\"data\":" + tj + "}");
+    return;
   }
   if (cfgTelem.length()) {  // 汎用エンドポイント (Cloudflare Worker 等) へPOST
-    // [診断 v1.2.2] WS接続中でもマーカー付きで併送し、どちらの経路で届くか切り分ける
-    String hj = tj;
-    if (wsConnected) hj = tj.substring(0, tj.length() - 1) + ",\"via\":\"http\"}";
     WiFiClientSecure c; c.setInsecure();
     HTTPClient h;
     if (h.begin(c, cfgTelem)) {
       h.addHeader("Content-Type", "application/json");
       if (cfgKey.length()) h.addHeader("X-Device-Key", cfgKey);
-      h.POST(hj);
+      h.POST(tj);
       h.end();
     }
     return;
   }
-  if (wsConnected) return;
   if (!cfgToken.length() || !cfgRepo.length()) return;
   String path = "feed/telemetry.json";
   String api = "https://api.github.com/repos/" + cfgRepo + "/contents/" + path;
