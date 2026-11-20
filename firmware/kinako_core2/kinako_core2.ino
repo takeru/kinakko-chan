@@ -31,7 +31,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.4.1"
+#define FW_VERSION "1.4.2"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -54,6 +54,8 @@ M5Canvas faceCanvas(&M5.Display);   // 顔描画用オフスクリーン (ダブ
 bool faceCanvasOk = false;
 uint32_t blinkAt = 0;
 bool blinking = false;
+bool talkingNow = false, wasTalking = false, talkOpen = false;
+uint32_t talkFlipAt = 0;
 
 // ---------------- シーン実行 ----------------
 JsonDocument residentDoc;           // 常駐シーン (イベント定義を保持)
@@ -233,9 +235,12 @@ void drawFace() {
     }
   }
 
-  // 口 (小さめ)
+  // 口 (小さめ。再生中は口パクが優先, v1.4.2)
   int mx = 160, my = 140;
-  if (emotion == "happy" || emotion == "love") {
+  if (talkingNow && emotion != "sleep") {
+    if (talkOpen) d.fillEllipse(mx, my + 1, 6, 8, darkC);  // 開いた口
+    else d.fillEllipse(mx, my, 6, 2, darkC);               // 閉じた口
+  } else if (emotion == "happy" || emotion == "love") {
     d.drawArc(mx, my - 6, 11, 14, 20, 160, darkC);
   } else if (emotion == "sad") {
     d.drawArc(mx, my + 10, 9, 12, 200, 340, darkC);
@@ -743,6 +748,13 @@ void loop() {
     blinkAt = now + 140;
   }
   if (blinking && now > blinkAt) { blinking = false; faceDirty = true; }
+
+  // 口パク (音声の再生中だけ口を開閉させる, v1.4.2)
+  talkingNow = M5.Speaker.isPlaying();
+  if (talkingNow) {
+    if (now > talkFlipAt) { talkOpen = !talkOpen; talkFlipAt = now + 130; faceDirty = true; }
+  } else if (wasTalking) { talkOpen = false; faceDirty = true; }
+  wasTalking = talkingNow;
 
   // ボタン
   if (M5.BtnA.wasPressed()) { btnCount++; fireEvent("on_button_a"); }
