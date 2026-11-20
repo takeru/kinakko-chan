@@ -1,0 +1,17 @@
+[Unit]
+Description=KinakoCore2 event listener (Worker /admin/ws -> local spool)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# HOME を固定する: websockets は hatch のユーザsite-packages にあり、
+# スプール/ハートビートの既定パスも ~/hooks/state を指すため
+Environment=HOME=/home/hatch
+WorkingDirectory=/home/hatch/workspace/m5core2-kinako
+ExecStart=/usr/bin/python3 /home/hatch/workspace/m5core2-kinako/tools/event_listener.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

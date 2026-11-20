@@ -22,9 +22,10 @@
 //  3. KV に残すのは書き込み頻度の低いものだけ: 最新シーン、マニフェスト、
 //     ファームウェア本体 (約1.6MB。DO ストレージの値サイズ上限を超えるため
 //     置き場所としても KV が正しい)。
-//  4. フック (きなこ側VM) の /admin/events ポーリング (10秒間隔) は
-//     Worker リクエスト月約26万回 = 含まれる1,000万回の 2.6%。安いので
-//     間隔は延ばさない (起床の速さを優先)。since= で新着だけを返す。
+//  4. 起床経路は /admin/ws のイベント配信が主: VM の常駐リスナーが
+//     イベントを即受けてローカルスプールへ書き、フックは 5 秒間隔で
+//     スプールを読むだけ (Worker リクエストほぼゼロ)。従来の
+//     /admin/events ポーリングはリスナー停止時の予備として残す。
 //
 // 端末向け (DEVICE_KEY):
 //   GET  /ws (WebSocket upgrade, ?key=DEVICE_KEY)
@@ -40,6 +41,7 @@
 //   POST /admin/reflex     リフレックス設定を DO ストレージへ保存
 //   GET  /admin/telemetry  最新テレメトリ
 //   GET  /admin/status     端末の接続状態
+//   GET  /admin/ws         イベント配信 (WebSocket)。常駐リスナーが接続し、端末イベントを即受ける
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -142,6 +144,10 @@ export default {
       if (!admOK) return deny();
       return hub().fetch(new Request("https://hub/status"));
     }
+    if (path === "/admin/ws") {
+      if (!admOK && url.searchParams.get("key") !== env.ADMIN_KEY) return deny();
+      return hub().fetch(new Request("https://hub/admin-ws", request));
+    }
     if (path === "/") return new Response("KinakoCore2 bus is running");
     return new Response("not found", { status: 404 });
   },
@@ -164,24 +170,46 @@ export class DeviceHub {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       // ★冬眠API: accept() ではなくこちら。接続中アイドルの duration 課金が消える
-      this.state.acceptWebSocket(server);
+      // タグ "device" を付ける (配信専用の "listener" と区別するため)
+      this.state.acceptWebSocket(server, ["device"]);
       // 再接続時の取りこぼし防止: KVの最新シーンを即流し込む
       const scene = await this.env.KINAKO.get("scene");
       if (scene) { try { server.send(scene); } catch { /* noop */ } }
       return new Response(null, { status: 101, webSocket: client });
     }
+    if (url.pathname === "/admin-ws") {
+      // イベント配信口: 常駐リスナー (きなこ側VM) がぶら下がる受信専用ソケット。
+      // 端末イベントが来た瞬間に webSocketMessage からここへ流す。
+      if (request.headers.get("Upgrade") !== "websocket")
+        return new Response("expected websocket", { status: 426 });
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.state.acceptWebSocket(server, ["listener"]);
+      try { server.send(JSON.stringify({ type: "listening" })); } catch { /* noop */ }
+      return new Response(null, { status: 101, webSocket: client });
+    }
     if (url.pathname === "/send" && request.method === "POST") {
       const body = await request.text();
+      // 送信先は端末だけ (リスナーへは送らない)。移行直後でタグ無し
+      // ソケットしか無い場合は、リスナー以外全部へ送るフォールバック。
+      let targets = this.state.getWebSockets("device");
+      if (!targets.length) {
+        targets = this.state.getWebSockets().filter(
+          (s) => !this.state.getTags(s).includes("listener"));
+      }
       let sent = 0;
-      for (const ws of this.state.getWebSockets()) {
+      for (const ws of targets) {
         try { ws.send(body); sent++; } catch { /* 切れているソケットは無視 */ }
       }
       return sent > 0 ? new Response("sent") : new Response("offline", { status: 202 });
     }
     if (url.pathname === "/status") {
-      const n = this.state.getWebSockets().length;
-      return new Response(JSON.stringify({ connected: n > 0, sockets: n }),
-        { headers: { "Content-Type": "application/json" } });
+      const devices = this.state.getWebSockets("device").length;
+      const listeners = this.state.getWebSockets("listener").length;
+      const total = this.state.getWebSockets().length;
+      return new Response(JSON.stringify({
+        connected: total > listeners, sockets: total, devices, listeners,
+      }), { headers: { "Content-Type": "application/json" } });
     }
     if (url.pathname === "/events" && request.method === "GET") {
       const since = Number(url.searchParams.get("since") || 0);
@@ -210,6 +238,8 @@ export class DeviceHub {
 
   // 冬眠から起きた後もこのハンドラが呼ばれる (状態は storage から読む)
   async webSocketMessage(ws, message) {
+    // リスナーは受信専用。そのメッセージは端末イベントとして扱わない
+    if (this.state.getTags(ws).includes("listener")) return;
     try {
       const msg = JSON.parse(message);
       if (msg.type === "telemetry") {
@@ -218,9 +248,10 @@ export class DeviceHub {
         await this.state.storage.put("telemetry", typeof message === "string" ? message : JSON.stringify(msg));
       }
       if (msg.type === "event") {
-        // イベントログ (直近50件) — フックが /admin/events で見て きなこを起こす
+        const ts = Date.now();
+        // イベントログ (直近50件) — 予備経路のフックが /admin/events で見る
         const log = (await this.state.storage.get("events")) || [];
-        log.push({ ts: Date.now(), event: msg.event, seq: msg.seq ?? null });
+        log.push({ ts, event: msg.event, seq: msg.seq ?? null });
         while (log.length > 50) log.shift();
         await this.state.storage.put("events", log);
         // リフレックス: DO ストレージの reflex 設定に一致すれば、その場で
@@ -231,6 +262,11 @@ export class DeviceHub {
         if (scene) {
           scene.transient = true;
           try { ws.send(JSON.stringify(scene)); } catch { /* noop */ }
+        }
+        // イベント配信: 常駐リスナーへ即送る (起床をポーリングから切り離す主経路)
+        const note = JSON.stringify({ type: "event", event: msg.event, seq: msg.seq ?? null, ts });
+        for (const lws of this.state.getWebSockets("listener")) {
+          try { lws.send(note); } catch { /* noop */ }
         }
       }
     } catch { /* JSONでないメッセージは無視 */ }
