@@ -31,7 +31,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.3.2"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -50,6 +50,8 @@ bool faceDirty = true;
 bool canvasMode = false;            // 自由描画 (draw/image) 中は顔で上書きしない
 bool canvasOk = false;              // オフスクリーン確保済みか
 M5Canvas canvas(&M5.Display);       // 自由描画用オフスクリーン (320x240, PSRAM)
+M5Canvas faceCanvas(&M5.Display);   // 顔描画用オフスクリーン (ダブルバッファでちらつき防止)
+bool faceCanvasOk = false;
 uint32_t blinkAt = 0;
 bool blinking = false;
 
@@ -148,9 +150,12 @@ String b64encode(const String& in) {
 
 // ---------------- 顔描画 ----------------
 void drawFace() {
-  auto& d = M5.Display;
   uint32_t now = millis();
   if (canvasMode && now >= bigUntil) { faceDirty = false; return; }  // 自由描画モード中は顔で上書きしない (通知表示中は除く)
+  // 顔はオフスクリーンに描いてから一括転送する (ダブルバッファ)。
+  // 直接描くと fillScreen の黒で画面が点滅して見える (まばたき毎のちらつき対策, v1.3.2)
+  if (!faceCanvasOk) faceCanvasOk = (faceCanvas.createSprite(320, 240) != nullptr);
+  LovyanGFX& d = faceCanvasOk ? static_cast<LovyanGFX&>(faceCanvas) : static_cast<LovyanGFX&>(M5.Display);
   if (now < bigUntil) {  // 通知の全画面表示
     d.fillScreen(d.color888(24, 60, 120));
     d.setFont(&fonts::lgfxJapanGothic_24);
@@ -160,6 +165,7 @@ void drawFace() {
     d.setFont(&fonts::lgfxJapanGothic_16);
     d.drawString(bigBody, 160, 140);
     d.setTextDatum(textdatum_t::top_left);
+    if (faceCanvasOk) faceCanvas.pushSprite(0, 0);
     faceDirty = false;
     return;
   }
@@ -224,6 +230,7 @@ void drawFace() {
   String st = "KinakoCore2 v" + String(FW_VERSION) + "  seq:" + String(residentSeq) +
               "  batt:" + String(M5.Power.getBatteryLevel()) + "%";
   d.drawString(st, 6, 226);
+  if (faceCanvasOk) faceCanvas.pushSprite(0, 0);
   faceDirty = false;
 }
 
@@ -504,6 +511,7 @@ String telemetryJson() {
   M5.Imu.getAccel(&ax, &ay, &az);
   M5.Imu.getGyro(&gx, &gy, &gz);
   JsonDocument doc;
+  doc["version"] = FW_VERSION;  // 遠隔からファーム版数を確定できるように (v1.3.1〜)
   doc["seq"] = residentSeq;
   doc["emotion"] = emotion;
   doc["battery"] = M5.Power.getBatteryLevel();

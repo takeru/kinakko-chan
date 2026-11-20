@@ -11,7 +11,7 @@
                                                OTAマニフェストを feed/manifest.json に生成
 配信 = feed/ をGitHubリポジトリにcommit&pushすること。端末は10秒以内に拾う。
 """
-import argparse, hashlib, json, os, shutil, sys, urllib.request
+import argparse, hashlib, json, os, shutil, sys, time, urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -144,6 +144,31 @@ def main():
         print("リフレックス設定を反映 (Workerが即時応答するルール)")
     if a.cmd == "cf-firmware":
         print(cf_call(f"/admin/firmware?version={a.version}", Path(a.bin).read_bytes(), "application/octet-stream"))
+        # KV は結果整合で、マニフェストが端末側から見えるまで最大 ~60 秒かかる。
+        # 見える前に {"type":"ota"} トリガを撃つと端末は旧版を見て素通りする
+        # (v1.3.0/1.3.1 で実際に踏んだ)。デバイスキーでの読みで新版が見える
+        # まで待ってからトリガする。
+        base, _ = cf_base_key()
+        kv = {}
+        envf = ROOT / "cloudflare" / "keys.env"
+        if envf.exists():
+            kv = dict(l.split("=", 1) for l in envf.read_text().splitlines() if "=" in l)
+        devkey = os.environ.get("KINAKO_CF_DEVICE_KEY", "") or kv.get("DEVICE_KEY", "")
+        visible = False
+        if devkey:
+            for _ in range(10):
+                try:
+                    req = urllib.request.Request(base + "/manifest.json")
+                    req.add_header("X-Device-Key", devkey)
+                    req.add_header("User-Agent", "kinako-tools/1.0")
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        if json.loads(r.read()).get("version") == a.version:
+                            visible = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(10)
+        print("マニフェスト伝播:", "確認できた" if visible else "未確認 (60秒ポーリングで拾います)")
         # v1.2.5+ は WS の {"type":"ota"} で即時チェックする (旧版は無視するので無害)
         try:
             print("即時チェック送信:", cf_call("/admin/send-live", b'{"type":"ota"}'))
