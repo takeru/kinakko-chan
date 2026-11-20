@@ -31,7 +31,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.2.1"
+#define FW_VERSION "1.2.3"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 600000;
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -371,7 +371,12 @@ void pollOta() {
     WiFiClientSecure client;
     client.setInsecure();
     httpUpdate.rebootOnUpdate(true);
-    httpUpdate.update(client, bin);  // 成功時はここで再起動する
+    // httpUpdate はカスタムヘッダを付けられない。Worker の /firmware.bin は
+    // デバイスキー必須なので、キーがある場合はクエリパラメータで渡す
+    // (v1.2.2 まではキー無しで 401 になり OTA が常に失敗していた)
+    String u = bin;
+    if (cfgKey.length()) u += (u.indexOf('?') >= 0 ? "&key=" : "?key=") + cfgKey;
+    httpUpdate.update(client, u);  // 成功時はここで再起動する
   }
 }
 
@@ -401,21 +406,27 @@ String telemetryJson() {
 }
 
 void pushTelemetry() {
+  String tj = telemetryJson();
   if (wsConnected) {
-    wsClient.sendTXT("{\"type\":\"telemetry\",\"data\":" + telemetryJson() + "}");
-    return;
+    // [診断 v1.2.2] 60秒タイマの発火をイベント経路でも知らせる (テレメトリ未着の切り分け用)
+    wsClient.sendTXT("{\"type\":\"event\",\"event\":\"telemetry_tick\"}");
+    wsClient.sendTXT("{\"type\":\"telemetry\",\"data\":" + tj + "}");
   }
   if (cfgTelem.length()) {  // 汎用エンドポイント (Cloudflare Worker 等) へPOST
+    // [診断 v1.2.2] WS接続中でもマーカー付きで併送し、どちらの経路で届くか切り分ける
+    String hj = tj;
+    if (wsConnected) hj = tj.substring(0, tj.length() - 1) + ",\"via\":\"http\"}";
     WiFiClientSecure c; c.setInsecure();
     HTTPClient h;
     if (h.begin(c, cfgTelem)) {
       h.addHeader("Content-Type", "application/json");
       if (cfgKey.length()) h.addHeader("X-Device-Key", cfgKey);
-      h.POST(telemetryJson());
+      h.POST(hj);
       h.end();
     }
     return;
   }
+  if (wsConnected) return;
   if (!cfgToken.length() || !cfgRepo.length()) return;
   String path = "feed/telemetry.json";
   String api = "https://api.github.com/repos/" + cfgRepo + "/contents/" + path;
