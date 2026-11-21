@@ -31,6 +31,9 @@
 //   GET  /ws (WebSocket upgrade, ?key=DEVICE_KEY)
 //   GET  /scene.json /manifest.json /firmware.bin
 //   POST /telemetry (WSが落ちている時のフォールバック)
+//   POST /stt (録音WAVを受けて Workers AI の Whisper で文字起こし。
+//        結果は {text} で端末へ返し、同時に on_speech イベントとして
+//        ハブ経由でリスナー (きなこ) へも届ける)
 // 管理向け (ADMIN_KEY):
 //   POST /admin/send       シーンをKVに保存し、接続中なら即送信
 //   POST /admin/scene      KV保存のみ
@@ -83,6 +86,30 @@ export default {
       // WS 送信と同じ置き場所 (DO ストレージ) に一本化する
       const body = await request.text();
       return hub().fetch(new Request("https://hub/telemetry", { method: "POST", body }));
+    }
+    if (path === "/stt" && request.method === "POST") {
+      if (!devOK) return deny();
+      // 端末の録音は最大10秒 (16kHz/16bit/モノラル = 約320KB)。上限に余裕を持たせる
+      const buf = await request.arrayBuffer();
+      if (!buf.byteLength || buf.byteLength > 700000)
+        return new Response("bad size (1..700000)", { status: 400 });
+      if (!env.AI) return new Response("ai binding missing", { status: 500 });
+      let text = "";
+      try {
+        // whisper-large-v3-turbo のバインディング入力は base64 文字列
+        const res = await env.AI.run("@cf/openai/whisper-large-v3-turbo",
+          { audio: arrayBufferToBase64(buf) });
+        text = ((res && res.text) || "").trim();
+      } catch (e) {
+        return new Response(JSON.stringify({ error: String((e && e.message) || e) }),
+          { status: 502, headers: { "Content-Type": "application/json" } });
+      }
+      // 聞き取れたら on_speech イベントとしてハブへ (ログ+リスナー配信+リフレックス)
+      if (text) {
+        await hub().fetch(new Request("https://hub/speech",
+          { method: "POST", body: JSON.stringify({ text }) }));
+      }
+      return json(JSON.stringify({ text }));
     }
     if (path === "/admin/send" && request.method === "POST") {
       if (!admOK) return deny();
@@ -233,6 +260,34 @@ export class DeviceHub {
       catch { return new Response("bad json", { status: 400 }); }
       return new Response("ok");
     }
+    if (url.pathname === "/speech" && request.method === "POST") {
+      // Worker の /stt が文字起こし結果をここへ渡す。端末イベント
+      // (webSocketMessage の msg.type==="event") と同じ形に揃える:
+      // ログへ追記し、リスナーへ即配信し、on_speech のリフレックスが
+      // あれば端末へ返す。ログ/配信には text も載せる (WSイベントと違う点)。
+      let text = "";
+      try { text = (await request.json()).text || ""; }
+      catch { return new Response("bad json", { status: 400 }); }
+      if (!text) return new Response("empty text", { status: 400 });
+      const ts = Date.now();
+      const log = (await this.state.storage.get("events")) || [];
+      log.push({ ts, event: "on_speech", seq: null, text });
+      while (log.length > 50) log.shift();
+      await this.state.storage.put("events", log);
+      const reflex = await this.state.storage.get("reflex");
+      const scene = reflex && reflex["on_speech"];
+      if (scene) {
+        scene.transient = true;
+        for (const ws of this.state.getWebSockets("device")) {
+          try { ws.send(JSON.stringify(scene)); } catch { /* noop */ }
+        }
+      }
+      const note = JSON.stringify({ type: "event", event: "on_speech", seq: null, text, ts });
+      for (const lws of this.state.getWebSockets("listener")) {
+        try { lws.send(note); } catch { /* noop */ }
+      }
+      return new Response("ok");
+    }
     return new Response("not found", { status: 404 });
   }
 
@@ -279,6 +334,16 @@ export class DeviceHub {
   }
 }
 
+// ArrayBuffer → base64 (スタック溢れ回避のためチャンク変換)
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
 function keyOK(request, expected) {
   if (!expected) return true;
   const auth = request.headers.get("Authorization") || "";

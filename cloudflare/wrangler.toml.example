@@ -21,3 +21,11 @@ bindings = [{ name = "HUB", class_name = "DeviceHub" }]
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DeviceHub"]
+
+# Workers AI (音声の文字起こし Whisper)。env.AI.run で使う
+[ai]
+binding = "AI"
+
+# Workers AI (音声の文字起こし Whisper)。env.AI.run で使う
+[ai]
+binding = "AI"

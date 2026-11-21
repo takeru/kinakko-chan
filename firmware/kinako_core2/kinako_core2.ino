@@ -31,7 +31,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.4.2"
+#define FW_VERSION "1.5.1"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -56,6 +56,14 @@ uint32_t blinkAt = 0;
 bool blinking = false;
 bool talkingNow = false, wasTalking = false, talkOpen = false;
 uint32_t talkFlipAt = 0;
+// ---- 音声入力 (STT, v1.5.0): 長押しで6秒録音 → Worker の Whisper へ ----
+const int REC_SECONDS = 6;
+const int REC_RATE = 16000;
+const size_t REC_SAMPLES = (size_t)REC_RATE * REC_SECONDS;
+uint8_t* recBuf = nullptr;  // WAVヘッダ44byte + PCM16モノラル (PSRAM)
+bool recording = false;
+bool pendingTouch = false;
+uint32_t touchDownAt = 0;
 
 // ---------------- シーン実行 ----------------
 JsonDocument residentDoc;           // 常駐シーン (イベント定義を保持)
@@ -172,38 +180,37 @@ void drawFace() {
     return;
   }
   d.fillScreen(TFT_BLACK);
-  // ---- きなっこちゃんの顔 (もふもふフード, v1.4.0) ----
-  // ユーザーが選んだぬいぐるみの顔を図形で再構成した常時顔。
-  // 感情とまばたきは目と口の形で表す (色は写真から採った近似値)。
-  uint16_t hoodC  = d.color565(240, 233, 216);  // フード (アイボリー)
-  uint16_t hoodS  = d.color565(221, 209, 187);  // フードの影
-  uint16_t faceC  = d.color565(247, 217, 190);  // 顔 (ピーチ)
-  uint16_t faceS  = d.color565(239, 200, 163);  // 顔の影
-  uint16_t cheekC = d.color565(244, 169, 184);  // ほっぺ
-  uint16_t darkC  = d.color565(43, 35, 32);     // 目と口
+  // ---- きなっこちゃんの顔 (ぬいぐるみの猫, v1.5.1) ----
+  // ユーザーのぬいぐるみ写真から再構成した常時顔: ベージュのクマ
+  // 着ぐるみフード (丸い耳) + ブルーグレーの猫顔 + 白い口元。
+  // 大きな黒目、小さなピンクの鼻、ωの口が特徴。
+  uint16_t hoodC  = d.color565(203, 168, 120);  // フード (タン)
+  uint16_t hoodS  = d.color565(172, 138, 92);   // フードの影
+  uint16_t earInC = d.color565(228, 205, 170);  // 耳の内側
+  uint16_t faceC  = d.color565(150, 148, 158);  // 猫の毛 (ブルーグレー)
+  uint16_t faceS  = d.color565(126, 124, 136);  // 顔の影
+  uint16_t muzzleC = d.color565(246, 244, 241); // 口元 (白)
+  uint16_t noseC  = d.color565(233, 131, 120);  // 鼻 (サーモンピンク)
+  uint16_t darkC  = d.color565(38, 36, 40);     // 目と口
   uint16_t heartC = d.color565(232, 106, 146);  // ハート目
 
-  // フード: 影 → もふもふの縁 (円周上の小円) → 本体
+  // フード: 影 → 本体 → クマの丸い耳
   d.fillEllipse(160, 136, 120, 106, hoodS);
-  for (int a = 0; a < 360; a += 18) {
-    float r = a * 0.0174533f;
-    int fx = 160 + (int)(116 * cosf(r));
-    int fy = 130 + (int)(102 * sinf(r));
-    d.fillCircle(fx, fy, 13, hoodC);
-  }
   d.fillEllipse(160, 130, 116, 102, hoodC);
-  // 顔: 影つきの楕円
-  d.fillEllipse(160, 123, 64, 54, faceS);
-  d.fillEllipse(160, 119, 62, 52, faceC);
-  // ほっぺ
-  d.fillCircle(100, 139, 12, cheekC);
-  d.fillCircle(220, 139, 12, cheekC);
+  for (int ex : {74, 246}) {
+    d.fillCircle(ex, 50, 23, hoodC);
+    d.fillCircle(ex, 50, 11, earInC);
+  }
+  // 顔: 影つきの楕円 + 白い口元
+  d.fillEllipse(160, 126, 74, 62, faceS);
+  d.fillEllipse(160, 122, 72, 60, faceC);
+  d.fillEllipse(160, 146, 42, 24, muzzleC);
 
-  // 目
-  int eyeLX = 134, eyeRX = 186, eyeY = 110;
-  int rx = 7, ry = 10;
-  if (emotion == "surprise") { rx = 9; ry = 13; }
-  else if (emotion == "sad") { ry = 6; eyeY += 2; }
+  // 目 (大きくて少し垂れた黒目)
+  int eyeLX = 128, eyeRX = 192, eyeY = 112;
+  int rx = 14, ry = 18;
+  if (emotion == "surprise") { rx = 16; ry = 21; eyeY -= 2; }
+  else if (emotion == "sad") { ry = 11; eyeY += 3; }
   if (blinking && emotion != "sleep" && emotion != "happy" &&
       emotion != "love" && emotion != "dizzy") ry = 2;
   if (emotion == "love") {
@@ -221,35 +228,44 @@ void drawFace() {
     }
   } else if (emotion == "happy") {
     // 逆U字の目
-    d.drawArc(eyeLX, eyeY + 4, 8, 11, 180, 360, darkC);
-    d.drawArc(eyeRX, eyeY + 4, 8, 11, 180, 360, darkC);
+    d.drawArc(eyeLX, eyeY + 4, 11, 14, 180, 360, darkC);
+    d.drawArc(eyeRX, eyeY + 4, 11, 14, 180, 360, darkC);
   } else if (emotion == "sleep") {
-    d.fillEllipse(eyeLX, eyeY, 8, 2, darkC);
-    d.fillEllipse(eyeRX, eyeY, 8, 2, darkC);
+    d.fillEllipse(eyeLX, eyeY, 11, 2, darkC);
+    d.fillEllipse(eyeRX, eyeY, 11, 2, darkC);
   } else {
     d.fillEllipse(eyeLX, eyeY, rx, ry, darkC);
-    d.fillEllipse(eyeRX, eyeY, (emotion == "think") ? 3 : rx, ry, darkC);
-    if (ry > 3) {  // 目のハイライト (つぶらな瞳)
-      d.fillCircle(eyeLX - 2, eyeY - 3, 2, TFT_WHITE);
-      if (emotion != "think") d.fillCircle(eyeRX - 2, eyeY - 3, 2, TFT_WHITE);
+    d.fillEllipse(eyeRX, eyeY, (emotion == "think") ? 6 : rx, ry, darkC);
+    if (ry > 6) {  // 目のハイライト (小さな点)
+      d.fillCircle(eyeLX - 5, eyeY - 7, 2, TFT_WHITE);
+      if (emotion != "think") d.fillCircle(eyeRX - 5, eyeY - 7, 2, TFT_WHITE);
     }
   }
 
-  // 口 (小さめ。再生中は口パクが優先, v1.4.2)
-  int mx = 160, my = 140;
+  // 鼻 (小さな逆三角)
+  d.fillTriangle(154, 130, 166, 130, 160, 138, noseC);
+
+  // 口 (猫のω口。再生中は口パクが優先, v1.4.2)
+  int mx = 160, my = 142;
   if (talkingNow && emotion != "sleep") {
-    if (talkOpen) d.fillEllipse(mx, my + 1, 6, 8, darkC);  // 開いた口
-    else d.fillEllipse(mx, my, 6, 2, darkC);               // 閉じた口
+    if (talkOpen) d.fillEllipse(mx, my + 2, 5, 7, darkC);  // 開いた口
+    else {  // 閉じている時はω口
+      d.drawArc(mx - 8, my - 2, 5, 7, 20, 160, darkC);
+      d.drawArc(mx + 8, my - 2, 5, 7, 20, 160, darkC);
+    }
   } else if (emotion == "happy" || emotion == "love") {
-    d.drawArc(mx, my - 6, 11, 14, 20, 160, darkC);
+    d.drawArc(mx, my - 4, 10, 13, 20, 160, darkC);
   } else if (emotion == "sad") {
-    d.drawArc(mx, my + 10, 9, 12, 200, 340, darkC);
+    d.drawArc(mx, my + 12, 8, 11, 200, 340, darkC);
   } else if (emotion == "surprise") {
-    d.fillEllipse(mx, my, 6, 8, darkC);
+    d.fillEllipse(mx, my + 4, 5, 7, darkC);
   } else if (emotion == "sleep") {
-    d.fillEllipse(mx, my + 2, 3, 4, darkC);
+    d.fillEllipse(mx, my + 2, 3, 3, darkC);
   } else {
-    d.fillEllipse(mx, my, 5, 4, darkC);
+    // ω口: 鼻の下から左右に小さな弧
+    d.drawLine(mx, 138, mx, 141, darkC);
+    d.drawArc(mx - 8, my - 2, 5, 7, 20, 160, darkC);
+    d.drawArc(mx + 8, my - 2, 5, 7, 20, 160, darkC);
   }
 
   // 吹き出し (セリフ)
@@ -403,6 +419,74 @@ bool playWavFromUrl(const String& url) {
   wavLen = got;
   M5.Speaker.playWav(wavBuf, wavLen);
   return true;
+}
+
+// ---------------- 音声入力 (STT, v1.5.0) ----------------
+// 画面の長押し (600ms) で6秒録音し、WAVにして Worker の POST /stt へ送る。
+// 文字起こし結果は吹き出しに表示され、同じ文が on_speech イベントとして
+// Worker 経由できなこにも届く (この関数は表示だけ担当)。
+String feedOrigin() {
+  int p = cfgFeed.indexOf("://");
+  if (p < 0) return String("");
+  int s = cfgFeed.indexOf('/', p + 3);
+  return (s < 0) ? cfgFeed : cfgFeed.substring(0, s);
+}
+
+void writeWavHeader(uint8_t* p, uint32_t dataLen) {
+  memcpy(p, "RIFF", 4); *(uint32_t*)(p + 4) = 36 + dataLen; memcpy(p + 8, "WAVE", 4);
+  memcpy(p + 12, "fmt ", 4); *(uint32_t*)(p + 16) = 16; *(uint16_t*)(p + 20) = 1;
+  *(uint16_t*)(p + 22) = 1; *(uint32_t*)(p + 24) = REC_RATE;
+  *(uint32_t*)(p + 28) = REC_RATE * 2; *(uint16_t*)(p + 32) = 2; *(uint16_t*)(p + 34) = 16;
+  memcpy(p + 36, "data", 4); *(uint32_t*)(p + 40) = dataLen;
+}
+
+void startRecording() {
+  if (recording || M5.Speaker.isPlaying()) return;
+  if (!recBuf) recBuf = (uint8_t*)ps_malloc(44 + REC_SAMPLES * 2);
+  if (!recBuf) return;
+  M5.Speaker.end();  // Core2 はマイクとスピーカーで I2S を共有する
+  M5.Mic.begin();
+  if (M5.Mic.record((int16_t*)(recBuf + 44), REC_SAMPLES, REC_RATE)) {
+    recording = true;
+    bubbleText = "ききとりちゅう…";
+    faceDirty = true;
+  } else {
+    M5.Mic.end();
+    M5.Speaker.begin();
+  }
+}
+
+void finishRecording() {
+  recording = false;
+  M5.Mic.end();
+  M5.Speaker.begin();
+  writeWavHeader(recBuf, REC_SAMPLES * 2);
+  bubbleText = "おくっているよ…";
+  faceDirty = true;
+  drawFace();  // アップロード中 (数秒ブロック) も状態が見えるように先に描く
+  String text = "";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(25000);
+  if (http.begin(client, feedOrigin() + "/stt")) {
+    if (cfgKey.length()) http.addHeader("X-Device-Key", cfgKey);
+    http.addHeader("Content-Type", "audio/wav");
+    int code = http.sendRequest("POST", recBuf, 44 + REC_SAMPLES * 2);
+    if (code == 200) {
+      StaticJsonDocument<1024> doc;
+      if (deserializeJson(doc, http.getString()) == DeserializationError::Ok)
+        text = (const char*)(doc["text"] | "");
+    }
+    http.end();
+  }
+  if (text.length()) {
+    bubbleText = (text.length() > 40) ? text.substring(0, 40) : text;
+    lastEvent = "on_speech";
+  } else {
+    bubbleText = "ききとれなかった…";
+  }
+  faceDirty = true;
 }
 
 void beep(int freq, int ms) { M5.Speaker.tone(freq, ms); }
@@ -761,10 +845,16 @@ void loop() {
   if (M5.BtnB.wasPressed()) { btnCount++; fireEvent("on_button_b"); }
   if (M5.BtnC.wasPressed()) { btnCount++; fireEvent("on_button_c"); }
 
-  // タッチ
-  if (M5.Touch.getCount() > 0) {
+  // タッチ (短タップ = on_touch / 600ms長押し = 話しかける, v1.5.0)
+  {
     auto t = M5.Touch.getDetail(0);
-    if (t.wasPressed()) {
+    if (t.wasPressed()) { touchDownAt = now; pendingTouch = true; }
+    if (pendingTouch && t.isPressed() && now - touchDownAt >= 600 && !recording) {
+      pendingTouch = false;
+      startRecording();
+    }
+    if (t.wasReleased() && pendingTouch) {
+      pendingTouch = false;
       touchCount++;
       if (bigUntil && now < bigUntil) { bigUntil = 0; faceDirty = true; lastEvent = "notify_dismissed"; }
       else fireEvent("on_touch");
@@ -793,6 +883,9 @@ void loop() {
   if (!wsConnected && now - lastFeed > FEED_POLL_MS) { lastFeed = now; pollFeed(); }
   if (otaRequested || now - lastOta > OTA_POLL_MS) { otaRequested = false; lastOta = now; pollOta(); }
   if (now - lastTelem > TELEM_POLL_MS) { lastTelem = now; pushTelemetry(); }
+
+  // 録音が終わったら文字起こしへ (v1.5.0)
+  if (recording && !M5.Mic.isRecording()) finishRecording();
 
   if (bigUntil && now > bigUntil) { bigUntil = 0; if (canvasMode && canvasOk) canvas.pushSprite(0, 0); else faceDirty = true; }
   if (faceDirty) drawFace();
