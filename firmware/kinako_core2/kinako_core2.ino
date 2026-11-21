@@ -28,17 +28,19 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <Adafruit_NeoPixel.h>
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.5.1"
+#define FW_VERSION "1.5.6"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
 
 // ---------------- 設定 (NVS) ----------------
 Preferences prefs;
-String cfgSsid, cfgPass, cfgFeed, cfgToken, cfgRepo, cfgTelem, cfgKey;
+String cfgSsid[3], cfgPass[3];  // WiFi プロファイル (最大3件, v1.5.3)
+String cfgFeed, cfgToken, cfgRepo, cfgTelem, cfgKey;
 bool apMode = false;
 
 // ---------------- 顔の状態 ----------------
@@ -56,14 +58,35 @@ uint32_t blinkAt = 0;
 bool blinking = false;
 bool talkingNow = false, wasTalking = false, talkOpen = false;
 uint32_t talkFlipAt = 0;
-// ---- 音声入力 (STT, v1.5.0): 長押しで6秒録音 → Worker の Whisper へ ----
-const int REC_SECONDS = 6;
+// ---- 音声入力 (STT, v1.5.2): プッシュトゥトーク ----
+// 画面を押している間だけ録音し、離したら Worker の Whisper へ送る。
+// M5.Mic.record() は固定長録音しかできないので 0.5秒チャンクをつなぐ。
 const int REC_RATE = 16000;
-const size_t REC_SAMPLES = (size_t)REC_RATE * REC_SECONDS;
+const int REC_MAX_SECONDS = 15;
+const size_t REC_CHUNK_SAMPLES = REC_RATE / 2;  // 0.5秒
+const size_t REC_MAX_SAMPLES = (size_t)REC_RATE * REC_MAX_SECONDS;
 uint8_t* recBuf = nullptr;  // WAVヘッダ44byte + PCM16モノラル (PSRAM)
 bool recording = false;
+bool recActive = false;      // チャンク録音中
+bool touchConsumed = false;  // この押下で録音を開始済み
+uint32_t recStopAt = 0;      // 離した時刻 (0 = まだ押している)
+uint32_t chunkStartedAt = 0;
+uint32_t recStartedAt = 0;
+uint32_t lastRecUi = 0;
+bool recLedOn = false;
+size_t recSamples = 0;       // 確定したサンプル数
 bool pendingTouch = false;
 uint32_t touchDownAt = 0;
+bool pressOnEar = false;  // 押した場所が耳かどうか (v1.5.4)
+
+// ---- M5GO Bottom2 の LED バー (SK6812 x10, GPIO25, v1.5.5) ----
+// 台座の両サイドに並ぶ拡散バー。録音中のフィードバックに使う。
+Adafruit_NeoPixel ledBar(10, 25, NEO_GRB + NEO_KHZ800);
+void ledBarAll(uint8_t r, uint8_t g, uint8_t b) {
+  for (int i = 0; i < 10; i++) ledBar.setPixelColor(i, ledBar.Color(r, g, b));
+  ledBar.show();
+}
+void ledBarOff() { ledBarAll(0, 0, 0); }
 
 // ---------------- シーン実行 ----------------
 JsonDocument residentDoc;           // 常駐シーン (イベント定義を保持)
@@ -284,6 +307,12 @@ void drawFace() {
   String st = "KinakoCore2 v" + String(FW_VERSION) + "  seq:" + String(residentSeq) +
               "  batt:" + String(M5.Power.getBatteryLevel()) + "%";
   d.drawString(st, 6, 226);
+  // 録音中インジケーター (吹き出し右上の赤い点滅バッジ)
+  if (recording) {
+    bool on = (millis() / 400) % 2 == 0;
+    d.fillCircle(300, 14, 8, TFT_WHITE);
+    d.fillCircle(300, 14, on ? 6 : 4, d.color565(229, 57, 53));
+  }
   if (faceCanvasOk) faceCanvas.pushSprite(0, 0);
   faceDirty = false;
 }
@@ -422,9 +451,9 @@ bool playWavFromUrl(const String& url) {
 }
 
 // ---------------- 音声入力 (STT, v1.5.0) ----------------
-// 画面の長押し (600ms) で6秒録音し、WAVにして Worker の POST /stt へ送る。
-// 文字起こし結果は吹き出しに表示され、同じ文が on_speech イベントとして
-// Worker 経由できなこにも届く (この関数は表示だけ担当)。
+// プッシュトゥトーク: 押している間チャンク録音し、離したら WAV にして
+// Worker の POST /stt へ送る。文字起こし結果は吹き出しに表示され、同じ文が
+// on_speech イベントとして Worker 経由できなこにも届く。
 String feedOrigin() {
   int p = cfgFeed.indexOf("://");
   if (p < 0) return String("");
@@ -442,13 +471,20 @@ void writeWavHeader(uint8_t* p, uint32_t dataLen) {
 
 void startRecording() {
   if (recording || M5.Speaker.isPlaying()) return;
-  if (!recBuf) recBuf = (uint8_t*)ps_malloc(44 + REC_SAMPLES * 2);
+  if (!recBuf) recBuf = (uint8_t*)ps_malloc(44 + REC_MAX_SAMPLES * 2);
   if (!recBuf) return;
   M5.Speaker.end();  // Core2 はマイクとスピーカーで I2S を共有する
   M5.Mic.begin();
-  if (M5.Mic.record((int16_t*)(recBuf + 44), REC_SAMPLES, REC_RATE)) {
+  recSamples = 0;
+  recStopAt = 0;
+  if (M5.Mic.record((int16_t*)(recBuf + 44), REC_CHUNK_SAMPLES, REC_RATE)) {
     recording = true;
+    recActive = true;
+    recStartedAt = chunkStartedAt = millis();
+    lastRecUi = 0;
     bubbleText = "ききとりちゅう…";
+    recLedOn = true;
+    ledBarAll(90, 0, 0);
     faceDirty = true;
   } else {
     M5.Mic.end();
@@ -458,38 +494,114 @@ void startRecording() {
 
 void finishRecording() {
   recording = false;
+  recActive = false;
+  recStopAt = 0;
+  ledBarOff();
   M5.Mic.end();
   M5.Speaker.begin();
-  writeWavHeader(recBuf, REC_SAMPLES * 2);
-  bubbleText = "おくっているよ…";
-  faceDirty = true;
-  drawFace();  // アップロード中 (数秒ブロック) も状態が見えるように先に描く
   String text = "";
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(25000);
-  if (http.begin(client, feedOrigin() + "/stt")) {
-    if (cfgKey.length()) http.addHeader("X-Device-Key", cfgKey);
-    http.addHeader("Content-Type", "audio/wav");
-    int code = http.sendRequest("POST", recBuf, 44 + REC_SAMPLES * 2);
-    if (code == 200) {
-      StaticJsonDocument<1024> doc;
-      if (deserializeJson(doc, http.getString()) == DeserializationError::Ok)
-        text = (const char*)(doc["text"] | "");
+  if (recSamples >= 1600) {  // 0.1秒未満は送らない
+    writeWavHeader(recBuf, recSamples * 2);
+    bubbleText = "おくっているよ…";
+    faceDirty = true;
+    drawFace();  // アップロード中 (数秒ブロック) も状態が見えるように先に描く
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(25000);
+    if (http.begin(client, feedOrigin() + "/stt")) {
+      if (cfgKey.length()) http.addHeader("X-Device-Key", cfgKey);
+      http.addHeader("Content-Type", "audio/wav");
+      int code = http.sendRequest("POST", recBuf, 44 + recSamples * 2);
+      if (code == 200) {
+        StaticJsonDocument<1024> doc;
+        if (deserializeJson(doc, http.getString()) == DeserializationError::Ok)
+          text = (const char*)(doc["text"] | "");
+      }
+      http.end();
     }
-    http.end();
   }
   if (text.length()) {
     bubbleText = (text.length() > 40) ? text.substring(0, 40) : text;
     lastEvent = "on_speech";
+    ledBarAll(0, 130, 50);  // 聞き取れたら緑でお知らせ
+    delay(400);
+    ledBarOff();
   } else {
     bubbleText = "ききとれなかった…";
+    for (int i = 0; i < 2; i++) { ledBarAll(120, 0, 0); delay(150); ledBarOff(); delay(150); }
   }
   faceDirty = true;
 }
 
+// 録音の進行管理: チャンクをつなぎ、離したら最終チャンクを離した
+// 時刻で切り取って送信する。録音中は LED 点滅 + 経過秒表示も更新。
+void serviceRecording(uint32_t now) {
+  if (!recording) return;
+  if (now - lastRecUi >= 250) {
+    lastRecUi = now;
+    recLedOn = !recLedOn;
+    // LED バー: 経過秒数だけ赤く埋まっていく (先端が点滅)
+    {
+      int lit = (int)((now - recStartedAt) / 1000) + 1;
+      if (lit > 10) lit = 10;
+      for (int i = 0; i < 10; i++) {
+        if (i < lit - 1) ledBar.setPixelColor(i, ledBar.Color(90, 0, 0));
+        else if (i == lit - 1) ledBar.setPixelColor(i, recLedOn ? ledBar.Color(220, 30, 30) : ledBar.Color(60, 0, 0));
+        else ledBar.setPixelColor(i, 0);
+      }
+      ledBar.show();
+    }
+    bubbleText = "ききとりちゅう " + String((now - recStartedAt) / 1000) + "びょう";
+    faceDirty = true;
+  }
+  if (recActive && !M5.Mic.isRecording()) {
+    recActive = false;
+    if (recStopAt) {
+      uint32_t ms = (recStopAt > chunkStartedAt) ? (recStopAt - chunkStartedAt) : 0;
+      size_t valid = (size_t)((uint64_t)ms * REC_RATE / 1000);
+      if (valid > REC_CHUNK_SAMPLES) valid = REC_CHUNK_SAMPLES;
+      recSamples += valid;
+      finishRecording();
+      return;
+    }
+    recSamples += REC_CHUNK_SAMPLES;
+    if (recSamples + REC_CHUNK_SAMPLES > REC_MAX_SAMPLES) { finishRecording(); return; }
+    if (M5.Mic.record((int16_t*)(recBuf + 44 + recSamples * 2), REC_CHUNK_SAMPLES, REC_RATE)) {
+      recActive = true;
+      chunkStartedAt = now;
+    } else {
+      finishRecording();
+    }
+  } else if (!recActive && recStopAt) {
+    finishRecording();
+  }
+}
+
 void beep(int freq, int ms) { M5.Speaker.tone(freq, ms); }
+
+// ---------------- 音量 (v1.5.6) ----------------
+int cfgVolume = 180;
+uint32_t cDownAt = 0, bcDownAt = 0, ledBarUntil = 0;
+
+void applyVolume(int v, bool announce) {
+  cfgVolume = constrain(v, 0, 255);
+  M5.Speaker.setVolume(cfgVolume);
+  prefs.begin("kinako", false);
+  prefs.putInt("volume", cfgVolume);
+  prefs.end();
+  if (announce) {
+    bubbleText = (cfgVolume == 0) ? "ミュート" : "おんりょう " + String(cfgVolume);
+    faceDirty = true;
+    if (!recording) {  // LED バーで量を少しの間だけ表示
+      int lit = (cfgVolume * 10 + 127) / 255;
+      for (int i = 0; i < 10; i++)
+        ledBar.setPixelColor(i, i < lit ? ledBar.Color(50, 38, 16) : 0);
+      ledBar.show();
+      ledBarUntil = millis() + 700;
+    }
+  }
+}
 
 // ---------------- DSL実行 ----------------
 void startSteps(JsonArray steps) {
@@ -540,6 +652,8 @@ void execStep(JsonObject s) {
     faceDirty = true;
   } else if (act == "brightness") {
     M5.Display.setBrightness(s["value"] | 160);
+  } else if (act == "volume") {
+    applyVolume(s["value"] | 180, false);
   } else if (act == "clear_text") {
     canvasMode = false;
     bubbleText = "";
@@ -716,8 +830,13 @@ void setupWeb() {
     if (apMode) {
       String html = "<html><head><meta charset='utf-8'><title>KinakoCore2 Setup</title></head><body>"
         "<h2>KinakoCore2 セットアップ</h2><form method='POST' action='/save'>"
-        "WiFi SSID <input name='ssid' value='" + cfgSsid + "'><br>"
-        "WiFi Password <input name='pass' type='password'><br>"
+        "WiFi 1 SSID <input name='ssid1' value='" + cfgSsid[0] + "'><br>"
+        "WiFi 1 Password <input name='pass1' type='password'><br>"
+        "WiFi 2 SSID <input name='ssid2' value='" + cfgSsid[1] + "'><br>"
+        "WiFi 2 Password <input name='pass2' type='password'><br>"
+        "WiFi 3 SSID <input name='ssid3' value='" + cfgSsid[2] + "'><br>"
+        "WiFi 3 Password <input name='pass3' type='password'><br>"
+        "音量 (0-255, 0=ミュート) <input name='volume' size='5' value='" + String(cfgVolume) + "'><br>"
         "Feed URL (scene.json の raw URL) <input name='feed' size='60' value='" + cfgFeed + "'><br>"
         "GitHub Repo (owner/name, テレメトリ用) <input name='repo' size='40' value='" + cfgRepo + "'><br>"
         "Telemetry URL (任意, 例 Cloudflare Worker) <input name='telem' size='60' value='" + cfgTelem + "'><br>"
@@ -731,8 +850,19 @@ void setupWeb() {
   });
   web.on("/save", HTTP_POST, []() {
     prefs.begin("kinako", false);
-    prefs.putString("ssid", web.arg("ssid"));
-    if (web.arg("pass").length()) prefs.putString("pass", web.arg("pass"));
+    {
+      char k[8];
+      for (int i = 0; i < 3; i++) {
+        snprintf(k, sizeof k, "ssid%d", i + 1);
+        prefs.putString(k, web.arg(k));
+        snprintf(k, sizeof k, "pass%d", i + 1);
+        if (web.arg(k).length()) prefs.putString(k, web.arg(k));
+      }
+    }
+    if (web.arg("volume").length()) {
+      int v = web.arg("volume").toInt();
+      prefs.putInt("volume", constrain(v, 0, 255));
+    }
     prefs.putString("feed", web.arg("feed"));
     prefs.putString("repo", web.arg("repo"));
     prefs.putString("telem", web.arg("telem"));
@@ -758,29 +888,91 @@ void setupWeb() {
   web.begin();
 }
 
+// ---------------- WiFi 接続 (複数プロファイル, v1.5.3) ----------------
+// 見えている既知APの中で一番電波の強いものにつなぐ。家とテザリングを
+// 行き来しても自動で切り替わる。SSID を隠しているAP用に、見えない
+// プロファイルも後で順に試す。
+bool tryConnect(int i, uint32_t timeoutMs) {
+  WiFi.begin(cfgSsid[i].c_str(), cfgPass[i].c_str());
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) delay(250);
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.disconnect();
+  return false;
+}
+
+bool connectWifi() {
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks();
+  bool tried[3] = {false, false, false};
+  for (int k = 0; k < 3; k++) {
+    int best = -1, bestRssi = -999;
+    for (int i = 0; i < 3; i++) {
+      if (!cfgSsid[i].length() || tried[i]) continue;
+      for (int j = 0; j < n; j++) {
+        if (WiFi.SSID(j) == cfgSsid[i] && (int)WiFi.RSSI(j) > bestRssi) {
+          bestRssi = WiFi.RSSI(j);
+          best = i;
+        }
+      }
+    }
+    if (best < 0) break;
+    tried[best] = true;
+    if (tryConnect(best, 12000)) { WiFi.scanDelete(); return true; }
+  }
+  WiFi.scanDelete();
+  for (int i = 0; i < 3; i++) {
+    if (!cfgSsid[i].length() || tried[i]) continue;
+    if (tryConnect(i, 10000)) return true;
+  }
+  return false;
+}
+
 // ---------------- setup / loop ----------------
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setBrightness(160);
   M5.Speaker.setVolume(180);
+  ledBar.begin();
+  ledBarAll(40, 26, 8);  // 起動確認のほんのり点灯
+  delay(300);
+  ledBarOff();
   M5.update();
   bool forcePortal = M5.BtnA.isPressed();
 
   prefs.begin("kinako", true);
-  cfgSsid = prefs.getString("ssid", "");
-  cfgPass = prefs.getString("pass", "");
+  {
+    char k[8];
+    for (int i = 0; i < 3; i++) {
+      snprintf(k, sizeof k, "ssid%d", i + 1); cfgSsid[i] = prefs.getString(k, "");
+      snprintf(k, sizeof k, "pass%d", i + 1); cfgPass[i] = prefs.getString(k, "");
+    }
+    if (!cfgSsid[0].length()) {  // 旧形式 (ssid/pass) からの移行
+      cfgSsid[0] = prefs.getString("ssid", "");
+      cfgPass[0] = prefs.getString("pass", "");
+    }
+  }
   cfgFeed = prefs.getString("feed", "");
   cfgToken = prefs.getString("token", "");
   cfgRepo = prefs.getString("repo", "");
   cfgTelem = prefs.getString("telem", "");
   cfgKey = prefs.getString("key", "");
   prefs.end();
+  cfgVolume = prefs.getInt("volume", 180);
+  M5.Speaker.setVolume(cfgVolume);
+  bool portalFlag = false;
+  {
+    prefs.begin("kinako", false);
+    portalFlag = prefs.getBool("portal", false);
+    if (portalFlag) prefs.putBool("portal", false);
+    prefs.end();
+  }
 
   emotion = "think";
   drawFace();
 
-  if (forcePortal || !cfgSsid.length()) {
+  if (forcePortal || portalFlag || !(cfgSsid[0].length() || cfgSsid[1].length() || cfgSsid[2].length())) {
     apMode = true;
     WiFi.mode(WIFI_AP);
     WiFi.softAP("KinakoCore2-Setup");
@@ -792,11 +984,7 @@ void setup() {
     return;
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) delay(250);
-  if (WiFi.status() != WL_CONNECTED) {  // つながらなければ設定APへ
+  if (!connectWifi()) {  // つながらなければ設定APへ
     apMode = true;
     WiFi.mode(WIFI_AP);
     WiFi.softAP("KinakoCore2-Setup");
@@ -814,7 +1002,7 @@ void setup() {
   pollFeed();
 }
 
-uint32_t lastFeed = 0, lastOta = 0, lastTelem = 0, lastBlink = 0, lastImu = 0;
+uint32_t lastFeed = 0, lastOta = 0, lastTelem = 0, lastBlink = 0, lastImu = 0, wifiDownSince = 0;
 
 void loop() {
   M5.update();
@@ -823,6 +1011,18 @@ void loop() {
 
   wsClient.loop();
   uint32_t now = millis();
+
+  // WiFi が20秒以上切れていたら再スキャンして一番強い既知APへ (v1.5.3)
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiDownSince) wifiDownSince = now;
+    else if (now - wifiDownSince > 20000) {
+      wifiDownSince = 0;
+      bubbleText = "WiFiをさがしているよ…";
+      faceDirty = true;
+      drawFace();
+      connectWifi();
+    }
+  } else wifiDownSince = 0;
 
   // まばたき
   if (now - lastBlink > 3400) {
@@ -843,21 +1043,58 @@ void loop() {
   // ボタン
   if (M5.BtnA.wasPressed()) { btnCount++; fireEvent("on_button_a"); }
   if (M5.BtnB.wasPressed()) { btnCount++; fireEvent("on_button_b"); }
-  if (M5.BtnC.wasPressed()) { btnCount++; fireEvent("on_button_c"); }
+  // ボタンC: 短く押して離すと音量サイクル (240→180→120→60→0ミュート, v1.5.6)
+  if (M5.BtnC.wasPressed()) { btnCount++; cDownAt = now; }
+  if (M5.BtnC.wasReleased()) {
+    if (cDownAt && now - cDownAt < 800 && !M5.BtnB.isPressed()) {
+      static const int levels[] = {240, 180, 120, 60, 0};
+      int idx = 1;
+      for (int i = 0; i < 5; i++) if (levels[i] == cfgVolume) idx = i;
+      applyVolume(levels[(idx + 1) % 5], true);
+      if (cfgVolume > 0) beep(cfgVolume >= 180 ? 1568 : 1047, 60);
+    }
+    cDownAt = 0;
+  }
+  // ボタンB+C 同時3秒長押し: 設定ポータルで再起動 (v1.5.6)
+  // (起動時Aボタン長押しは静電容量の初期較正で外しやすいので、その代替)
+  if (M5.BtnB.isPressed() && M5.BtnC.isPressed()) {
+    if (!bcDownAt) bcDownAt = now;
+    else if (now - bcDownAt >= 3000) {
+      prefs.begin("kinako", false);
+      prefs.putBool("portal", true);
+      prefs.end();
+      bubbleText = "せっていモードで さいきどうするね";
+      faceDirty = true;
+      drawFace();
+      delay(600);
+      ESP.restart();
+    }
+  } else bcDownAt = 0;
 
-  // タッチ (短タップ = on_touch / 600ms長押し = 話しかける, v1.5.0)
+  // タッチ (短タップ = on_touch / 耳を押している間 = プッシュトゥトーク, v1.5.4)
+  // 録音は顔の耳 (画面上のクマ耳) を押したときだけ始める。顔のタップや
+  // 長押しは なでなで (on_touch) として扱う。
   {
     auto t = M5.Touch.getDetail(0);
-    if (t.wasPressed()) { touchDownAt = now; pendingTouch = true; }
-    if (pendingTouch && t.isPressed() && now - touchDownAt >= 600 && !recording) {
-      pendingTouch = false;
+    if (t.wasPressed()) {
+      touchDownAt = now;
+      pendingTouch = true;
+      touchConsumed = false;
+      int dx1 = t.x - 74, dy1 = t.y - 50, dx2 = t.x - 246, dy2 = t.y - 50;
+      pressOnEar = (dx1 * dx1 + dy1 * dy1 <= 30 * 30) || (dx2 * dx2 + dy2 * dy2 <= 30 * 30);
+    }
+    if (pendingTouch && !touchConsumed && pressOnEar && t.isPressed() && now - touchDownAt >= 300 && !recording) {
+      touchConsumed = true;
       startRecording();
     }
-    if (t.wasReleased() && pendingTouch) {
+    if (t.wasReleased()) {
+      if (recording && !recStopAt) recStopAt = now;  // 離したら送信へ
+      if (pendingTouch && !touchConsumed) {
+        touchCount++;
+        if (bigUntil && now < bigUntil) { bigUntil = 0; faceDirty = true; lastEvent = "notify_dismissed"; }
+        else fireEvent("on_touch");
+      }
       pendingTouch = false;
-      touchCount++;
-      if (bigUntil && now < bigUntil) { bigUntil = 0; faceDirty = true; lastEvent = "notify_dismissed"; }
-      else fireEvent("on_touch");
     }
   }
 
@@ -884,10 +1121,11 @@ void loop() {
   if (otaRequested || now - lastOta > OTA_POLL_MS) { otaRequested = false; lastOta = now; pollOta(); }
   if (now - lastTelem > TELEM_POLL_MS) { lastTelem = now; pushTelemetry(); }
 
-  // 録音が終わったら文字起こしへ (v1.5.0)
-  if (recording && !M5.Mic.isRecording()) finishRecording();
+  // 録音の進行管理 (チャンク接続・送信・フィードバック, v1.5.2)
+  serviceRecording(now);
 
   if (bigUntil && now > bigUntil) { bigUntil = 0; if (canvasMode && canvasOk) canvas.pushSprite(0, 0); else faceDirty = true; }
+  if (ledBarUntil && now > ledBarUntil && !recording) { ledBarUntil = 0; ledBarOff(); }
   if (faceDirty) drawFace();
   delay(10);
 }

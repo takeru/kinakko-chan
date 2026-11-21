@@ -89,21 +89,36 @@ export default {
     }
     if (path === "/stt" && request.method === "POST") {
       if (!devOK) return deny();
-      // 端末の録音は最大10秒 (16kHz/16bit/モノラル = 約320KB)。上限に余裕を持たせる
+      // 端末の録音は最大15秒 (16kHz/16bit/モノラル = 約480KB)。上限に余裕を持たせる
       const buf = await request.arrayBuffer();
       if (!buf.byteLength || buf.byteLength > 700000)
         return new Response("bad size (1..700000)", { status: 400 });
       if (!env.AI) return new Response("ai binding missing", { status: 500 });
+      // 診断用に最新の録音を残す (管理キーの GET /admin/last-stt で取得)
+      try { await env.KINAKO.put("last-stt.wav", buf); } catch { /* noop */ }
       let text = "";
       try {
-        // whisper-large-v3-turbo のバインディング入力は base64 文字列
-        const res = await env.AI.run("@cf/openai/whisper-large-v3-turbo",
-          { audio: arrayBufferToBase64(buf) });
+        // whisper-large-v3-turbo のバインディング入力は base64 文字列。
+        // 日本語として聞き取る (自動判定だと短い発話を取り違える)。
+        // language 指定が弾かれたら無指定で再試行する。
+        const b64 = arrayBufferToBase64(buf);
+        let res;
+        try {
+          res = await env.AI.run("@cf/openai/whisper-large-v3-turbo",
+            { audio: b64, language: "ja" });
+        } catch {
+          res = await env.AI.run("@cf/openai/whisper-large-v3-turbo", { audio: b64 });
+        }
         text = ((res && res.text) || "").trim();
       } catch (e) {
         return new Response(JSON.stringify({ error: String((e && e.message) || e) }),
           { status: 502, headers: { "Content-Type": "application/json" } });
       }
+      // Whisper の有名な幻覚 (無音・不明瞭な音声で字幕コーパス由来の
+      // 定型句を返す) は聞き取り失敗として扱い、イベントにしない
+      const HALLU = new Set(["thank you", "thanks for watching",
+        "thank you for watching", "ご視聴ありがとうございました"]);
+      if (HALLU.has(text.toLowerCase().replace(/[。.!！?？\s]+$/u, ""))) text = "";
       // 聞き取れたら on_speech イベントとしてハブへ (ログ+リスナー配信+リフレックス)
       if (text) {
         await hub().fetch(new Request("https://hub/speech",
@@ -145,6 +160,12 @@ export default {
       await env.KINAKO.put("audio:" + name, buf);
       return new Response("ok " + buf.byteLength + " bytes, audio/" + name);
     }
+    if (path === "/admin/last-stt" && request.method === "GET") {
+      if (!admOK) return deny();
+      const v = await env.KINAKO.get("last-stt.wav", "arrayBuffer");
+      if (!v) return new Response("none", { status: 404 });
+      return new Response(v, { headers: { "Content-Type": "audio/wav" } });
+    }
     if (path === "/admin/events" && request.method === "GET") {
       if (!admOK) return deny();
       // イベントログは DO ストレージにある (強整合)。since はそのまま渡す
@@ -162,6 +183,10 @@ export default {
       const body = await request.text();
       try { JSON.parse(body); } catch { return new Response("bad json", { status: 400 }); }
       return hub().fetch(new Request("https://hub/reflex", { method: "POST", body }));
+    }
+    if (path === "/admin/reflex" && request.method === "GET") {
+      if (!admOK) return deny();
+      return hub().fetch(new Request("https://hub/reflex"));
     }
     if (path === "/admin/telemetry" && request.method === "GET") {
       if (!admOK) return deny();
@@ -254,11 +279,17 @@ export class DeviceHub {
       const v = await this.state.storage.get("telemetry");
       return v ? json(v) : json({});
     }
-    if (url.pathname === "/reflex" && request.method === "POST") {
-      const body = await request.text();
-      try { await this.state.storage.put("reflex", JSON.parse(body)); }
-      catch { return new Response("bad json", { status: 400 }); }
-      return new Response("ok");
+    if (url.pathname === "/reflex") {
+      if (request.method === "GET") {
+        const v = await this.state.storage.get("reflex");
+        return v ? json(v) : json({});
+      }
+      if (request.method === "POST") {
+        const body = await request.text();
+        try { await this.state.storage.put("reflex", JSON.parse(body)); }
+        catch { return new Response("bad json", { status: 400 }); }
+        return new Response("ok");
+      }
     }
     if (url.pathname === "/speech" && request.method === "POST") {
       // Worker の /stt が文字起こし結果をここへ渡す。端末イベント
@@ -317,6 +348,25 @@ export class DeviceHub {
         if (scene) {
           scene.transient = true;
           try { ws.send(JSON.stringify(scene)); } catch { /* noop */ }
+        }
+        // なでなで数え (2026-11-21 ユーザー指示): 単発タップの反応は
+        // 端末ローカル (常駐シーンの on_touch)。10秒以内に2回以上
+        // なでなでされたら Worker がごほうびシーン (reflex の on_pets)
+        // を返し、カウンタをリセットする。Muse は介在しない。
+        if (msg.event === "on_touch") {
+          const recent = ((await this.state.storage.get("pets")) || [])
+            .filter((t) => ts - t < 10000);
+          recent.push(ts);
+          if (recent.length >= 2) {
+            await this.state.storage.put("pets", []);
+            const bonus = reflex && reflex["on_pets"];
+            if (bonus) {
+              bonus.transient = true;
+              try { ws.send(JSON.stringify(bonus)); } catch { /* noop */ }
+            }
+          } else {
+            await this.state.storage.put("pets", recent);
+          }
         }
         // イベント配信: 常駐リスナーへ即送る (起床をポーリングから切り離す主経路)
         const note = JSON.stringify({ type: "event", event: msg.event, seq: msg.seq ?? null, ts });

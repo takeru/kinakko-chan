@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FEED = ROOT / "feed"
-ACTIONS = {"face", "say", "notify", "beep", "tone_seq", "wait", "led_text", "brightness", "clear_text", "draw", "image"}
+ACTIONS = {"face", "say", "notify", "beep", "tone_seq", "wait", "led_text", "brightness", "clear_text", "draw", "image", "volume"}
 DRAW_OPS = {"clear", "fill_rect", "rect", "fill_round_rect", "round_rect", "fill_circle", "circle",
             "fill_ellipse", "ellipse", "line", "fill_triangle", "triangle", "arc", "text"}
 EMOTIONS = {"normal", "happy", "sleep", "surprise", "sad", "love", "think", "dizzy"}
