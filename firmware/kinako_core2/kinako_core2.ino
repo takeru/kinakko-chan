@@ -32,7 +32,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
-#define FW_VERSION "1.5.6"
+#define FW_VERSION "1.5.8"
 static const uint32_t FEED_POLL_MS = 10000;
 static const uint32_t OTA_POLL_MS = 60000;  // 通常は WS の即時トリガが主経路。これは予備
 static const uint32_t TELEM_POLL_MS = 60000;
@@ -55,6 +55,7 @@ M5Canvas canvas(&M5.Display);       // 自由描画用オフスクリーン (320
 M5Canvas faceCanvas(&M5.Display);   // 顔描画用オフスクリーン (ダブルバッファでちらつき防止)
 bool faceCanvasOk = false;
 uint32_t blinkAt = 0;
+uint32_t lastScrollTick = 0;
 bool blinking = false;
 bool talkingNow = false, wasTalking = false, talkOpen = false;
 uint32_t talkFlipAt = 0;
@@ -291,13 +292,30 @@ void drawFace() {
     d.drawArc(mx + 8, my - 2, 5, 7, 20, 160, darkC);
   }
 
-  // 吹き出し (セリフ)
+  // 吹き出し (セリフ)。長い文は横スクロールで全文読める (v1.5.8)
   if (bubbleText.length()) {
     d.fillRoundRect(14, 8, 292, 44, 8, d.color565(40, 40, 40));
     d.setFont(&fonts::lgfxJapanGothic_16);
     d.setTextColor(TFT_WHITE);
-    d.setTextDatum(textdatum_t::middle_center);
-    d.drawString(bubbleText, 160, 30);
+    int tw = d.textWidth(bubbleText);
+    if (tw <= 284) {
+      d.setTextDatum(textdatum_t::middle_center);
+      d.drawString(bubbleText, 160, 30);
+    } else {
+      static String lastBubble = "";
+      static uint32_t scrollStart = 0;
+      if (bubbleText != lastBubble) { lastBubble = bubbleText; scrollStart = millis(); }
+      int over = tw - 284;
+      uint32_t scrollMs = (uint32_t)over * 1000 / 45;  // 45px/秒
+      uint32_t cycle = 900 + scrollMs + 900;           // 前後に静止時間
+      uint32_t t = (millis() - scrollStart) % cycle;
+      int off = 0;
+      if (t > 900) off = (t - 900 >= scrollMs) ? over : (int)((t - 900) * 45 / 1000);
+      d.setClipRect(16, 10, 288, 40);
+      d.setTextDatum(textdatum_t::middle_left);
+      d.drawString(bubbleText, 18 - off, 30);
+      d.clearClipRect();
+    }
     d.setTextDatum(textdatum_t::top_left);
   }
   // 状態行 (フードに埋もれないよう暗いピルを敷く)
@@ -501,6 +519,28 @@ void finishRecording() {
   M5.Speaker.begin();
   String text = "";
   if (recSamples >= 1600) {  // 0.1秒未満は送らない
+    // v1.5.7: 先頭のタッチノイズ (約0.35秒) を捨て、残りをピーク基準で
+    // 増幅してから送る (声が小さいと Whisper が幻覚を出しやすいので)
+    {
+      int16_t* smp = (int16_t*)(recBuf + 44);
+      const int skip = 5600;  // 0.35秒
+      if (recSamples > skip + 1600) {
+        int peak = 0;
+        for (int i = skip; i < recSamples; i++) {
+          int a = smp[i]; if (a < 0) a = -a; if (a > peak) peak = a;
+        }
+        float gain = (peak > 0) ? 26000.0f / peak : 1.0f;
+        if (gain > 6.0f) gain = 6.0f;
+        if (gain < 1.0f) gain = 1.0f;
+        int outLen = recSamples - skip;
+        for (int i = 0; i < outLen; i++) {
+          int v = (int)(smp[skip + i] * gain);
+          if (v > 32767) v = 32767; else if (v < -32767) v = -32767;
+          smp[i] = (int16_t)v;
+        }
+        recSamples = outLen;
+      }
+    }
     writeWavHeader(recBuf, recSamples * 2);
     bubbleText = "おくっているよ…";
     faceDirty = true;
@@ -522,7 +562,7 @@ void finishRecording() {
     }
   }
   if (text.length()) {
-    bubbleText = (text.length() > 40) ? text.substring(0, 40) : text;
+    bubbleText = (text.length() > 120) ? text.substring(0, 120) : text;
     lastEvent = "on_speech";
     ledBarAll(0, 130, 50);  // 聞き取れたら緑でお知らせ
     delay(400);
@@ -1039,6 +1079,12 @@ void loop() {
     if (now > talkFlipAt) { talkOpen = !talkOpen; talkFlipAt = now + 130; faceDirty = true; }
   } else if (wasTalking) { talkOpen = false; faceDirty = true; }
   wasTalking = talkingNow;
+
+  // 長い吹き出しのスクロール用に 100ms ごとに描き直す (v1.5.8)
+  if (bubbleText.length() && faceCanvasOk && now - lastScrollTick >= 100) {
+    faceCanvas.setFont(&fonts::lgfxJapanGothic_16);
+    if (faceCanvas.textWidth(bubbleText) > 284) { lastScrollTick = now; faceDirty = true; }
+  }
 
   // ボタン
   if (M5.BtnA.wasPressed()) { btnCount++; fireEvent("on_button_a"); }
